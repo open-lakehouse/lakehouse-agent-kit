@@ -179,18 +179,22 @@ rejected, as are credentials embedded in any URI or `host:port` field — userin
 (`https://user:pass@host`, `user@host:port`) or credential parameters such as
 `?token=`, `?api_key=`, `X-Amz-Signature=`, `aws_access_key_id=`, or Spark Connect's
 `;token=` (names are percent-decoded before matching). `host:port` fields additionally
-reject `? ; & # /` outright. Hosts — in `host:port` entries and URIs — must be a DNS name
-or IPv4 address validated label by label (so `a..b` and `user:pass` fail), or a bracketed
-literal that parses as a real IPv6 address (`[::1]` passes, `[deadbeef]` fails). Ports
-must be 1–65535 (port `0` is rejected).
+reject `? ; & # /` outright. URI and `host:port` values containing any control character
+(newline, tab, DEL, ESC, …) are rejected before parsing. Hosts — in `host:port` entries
+and URIs — must be a DNS name or IPv4 address validated label by label (so `a..b` and
+`user:pass` fail; a single trailing dot, as in `broker.example.com.`, is accepted), or a
+bracketed literal that parses as a real IPv6 address (`[::1]` passes, `[deadbeef]`
+fails). Ports must be 1–65535 (port `0` is rejected).
 
 **No message ever echoes a profile value.** Every error and warning the loader emits —
 for any field, and for file-level problems (TOML syntax, malformed `.env` lines, invalid
 UTF-8) — is a fixed text containing only: the file path, the field name, an entry number,
 a byte/line/column position, and canonical parameter names from the loader's own list
 (e.g. `x_amz_signature`, never the user's spelling). Section, key, variable, and profile
-names are shown only when they are plain identifiers (`[A-Za-z0-9_.-]{1,64}`), otherwise
-as `<name not shown>`. Values only ever appear in the normal output of a profile that
+names are shown only when the whole name is a plain identifier (`[A-Za-z0-9_.-]{1,255}`,
+matched against the full string, so a trailing newline or control character fails),
+otherwise as `<name not shown>`. This only affects display: `--profile NAME` is matched
+against the profile's real (trimmed) `[profile].name`, so long names remain selectable. Values only ever appear in the normal output of a profile that
 passed validation. The loader reports each referenced variable as `set` / `unset` in
 `_meta.secrets` and never prints a value.
 

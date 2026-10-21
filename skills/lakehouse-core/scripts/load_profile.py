@@ -31,6 +31,7 @@ import re
 import shlex
 import sys
 import tempfile
+import unicodedata
 from contextlib import redirect_stderr, redirect_stdout
 from urllib.parse import unquote, urlparse
 
@@ -69,9 +70,11 @@ SCHEMA: dict[str, dict[str, tuple[str, bool]]] = {
 SECTIONS_BY_PREFIX = sorted(SCHEMA, key=len, reverse=True)
 STORE_KINDS = ("s3",)
 INLINE_SECRET_KEYS = {"token", "password", "secret", "secret_key", "access_key", "bearer_token", "api_key"}
-ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-PLACEHOLDER_HOST_RE = re.compile(r"^[A-Z][A-Z0-9_]*_HOST$")
+# Guard regexes are always applied with .fullmatch(): `$` would also match before a
+# trailing newline, letting "name\n" through.
+ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+PLACEHOLDER_HOST_RE = re.compile(r"[A-Z][A-Z0-9_]*_HOST")
 # Query / `;param=` / fragment names that carry credentials (compared percent-decoded,
 # lower-case, `-` -> `_`).
 SECRET_URI_PARAMS = {
@@ -86,10 +89,10 @@ URI_PARAM_RE = re.compile(r"([;?&#])([A-Za-z0-9_.%-]+)=([^;&#]*)")
 HOSTPORT_FORBIDDEN = set("@?;&#/")
 # One DNS label (underscores allowed for *_HOST placeholders); hosts are validated per
 # label so empty labels (`a..b`) fail. Bracketed hosts must be real IPv6 literals.
-DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+DNS_LABEL_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
 # Names (sections, keys, variable names, profile names) are shown in messages only when
 # they look like plain identifiers; profile VALUES are never shown.
-SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+SAFE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,255}")
 # Stable message texts for value-bearing fields. They contain no part of the supplied
 # value: only the field name, an entry number, and canonical names from SECRET_URI_PARAMS.
 MSG_CRED_PARAMS = "credential parameter(s) {names} are not allowed; reference secrets by env-var name via a *_env key"
@@ -98,6 +101,7 @@ MSG_BAD_URI = "invalid URI (expected {schemes} with a host and an optional port 
 MSG_HP_USERINFO = "entry {n}: credentials (user@) are not allowed in host:port"
 MSG_HP_FORBIDDEN = "entry {n}: invalid host:port (characters ? ; & # / are not allowed; value not shown)"
 MSG_BAD_HOSTPORT = "entry {n}: invalid host:port (expected host:port with port 1-65535; value not shown)"
+MSG_CONTROL = "contains control characters (newline, tab, ...); value not shown"
 MSG_PLACEHOLDER_URI = "unfilled template placeholder host is not allowed; value not shown"
 MSG_PLACEHOLDER_HP = "entry {n}: unfilled template placeholder host is not allowed; value not shown"
 MSG_BAD_ENUM = "must be one of {choices}; value not shown"
@@ -108,7 +112,7 @@ MSG_BAD_NAME = "must match [A-Za-z0-9][A-Za-z0-9._-]*; value not shown"
 def shown(name) -> str:
     """A name as it may appear in a message, or a fixed stand-in if it isn't a plain
     identifier (so pasted secrets or control characters never reach the terminal)."""
-    return name if isinstance(name, str) and SAFE_NAME_RE.match(name) else "<name not shown>"
+    return name if isinstance(name, str) and SAFE_NAME_RE.fullmatch(name) else "<name not shown>"
 
 
 def valid_host(host: str) -> bool:
@@ -120,7 +124,14 @@ def valid_host(host: str) -> bool:
             return True
         except ValueError:
             return False
-    return 0 < len(host) <= 253 and all(DNS_LABEL_RE.match(label) for label in host.split("."))
+    if host.endswith("."):  # fully-qualified form, e.g. broker.example.com.
+        host = host[:-1]
+    return 0 < len(host) <= 253 and all(DNS_LABEL_RE.fullmatch(label) for label in host.split("."))
+
+
+def has_control_chars(value: str) -> bool:
+    """Any C0/C1 control or DEL — urllib may silently normalize some of these."""
+    return any(unicodedata.category(c) == "Cc" for c in value)
 
 
 def netloc_host(netloc: str) -> str:
@@ -234,9 +245,11 @@ def search_dirs(environ: dict, cwd: str, home: str) -> list[str]:
     return [cwd, os.path.join(xdg, "lakehouse")]
 
 
-def discover(environ: dict, cwd: str, home: str) -> list[tuple[str, str]]:
-    """Return [(path, profile name or '<unreadable: …>')] for every candidate profile file."""
-    found: list[tuple[str, str]] = []
+def discover(environ: dict, cwd: str, home: str) -> list[tuple[str, object, str]]:
+    """Return [(path, [profile].name or None, note)] for every candidate profile file. The
+    name is unsanitized (only trimmed, as validation would) and is used for exact --profile
+    matching; shown() is applied only when presenting it."""
+    found: list[tuple[str, object, str]] = []
     seen = set()
     for d in search_dirs(environ, cwd, home):
         for pattern in ("*.profile.toml", "*.profile.env"):
@@ -246,17 +259,18 @@ def discover(environ: dict, cwd: str, home: str) -> list[tuple[str, str]]:
                     continue
                 seen.add(real)
                 try:
-                    name = read_profile_file(path, []).get("profile", {}).get("name", "")
-                    found.append((path, shown(name) if name else "<no [profile].name>"))
+                    name = read_profile_file(path, []).get("profile", {}).get("name")
+                    name = name.strip() if isinstance(name, str) else None
+                    found.append((path, name, "" if name else "<no [profile].name>"))
                 except ProfileError as exc:
-                    found.append((path, f"<unreadable: {exc}>"))
+                    found.append((path, None, f"<unreadable: {exc}>"))
     return found
 
 
 def candidates_text(cands: list[tuple[str, str]], dirs: list[str]) -> str:
     if not cands:
         return f"  (no *.profile.toml / *.profile.env files in: {', '.join(dirs)})"
-    return "\n".join(f"  - {name}  ({path})" for path, name in cands)
+    return "\n".join(f"  - {note or shown(name)}  ({path})" for path, name, note in cands)
 
 
 def select(args, environ: dict, cwd: str, home: str):
@@ -276,7 +290,7 @@ def select(args, environ: dict, cwd: str, home: str):
         name, by = environ["LAKEHOUSE_PROFILE"], "LAKEHOUSE_PROFILE"
     if name:
         cands = discover(environ, cwd, home)
-        matches = [p for p, n in cands if n == name]
+        matches = [p for p, n, _ in cands if isinstance(n, str) and n == name]
         if len(matches) == 1:
             return matches[0], by
         dirs = search_dirs(environ, cwd, home)
@@ -353,12 +367,15 @@ def check_value(where: str, kind: str, value, errors: list[str]):
         if value not in STORE_KINDS:
             errors.append(f"{where}: " + MSG_BAD_ENUM.format(choices="|".join(STORE_KINDS)))
     elif kind == "name":
-        if not NAME_RE.match(value):
+        if not NAME_RE.fullmatch(value):
             errors.append(f"{where}: " + MSG_BAD_NAME)
     elif kind == "env_name":
-        if not ENV_NAME_RE.match(value):
+        if not ENV_NAME_RE.fullmatch(value):
             errors.append(f"{where}: must be an env var NAME (e.g. LAKEHOUSE_UC_TOKEN), "
                           "never the secret itself")
+    elif kind in ("http_url", "sc_uri", "s3_uri", "hostports") and has_control_chars(value):
+        errors.append(f"{where}: " + MSG_CONTROL)
+        return None
     elif kind in ("http_url", "sc_uri", "s3_uri"):
         schemes = {"http_url": ("http", "https"), "sc_uri": ("sc",), "s3_uri": ("s3", "s3a")}[kind]
         errs = credential_errors(where, value)
@@ -441,7 +458,7 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
                 errors.append(f"{section}.{key}: required value is empty")
             if kind in ("http_url", "sc_uri", "hostports") and isinstance(norm[key], str):
                 for n, host in enumerate(hosts_of(kind, norm[key]), start=1):
-                    if PLACEHOLDER_HOST_RE.match(host):
+                    if PLACEHOLDER_HOST_RE.fullmatch(host):
                         msg = f"{section}.{key}: " + (MSG_PLACEHOLDER_HP.format(n=n)
                                                       if kind == "hostports" else MSG_PLACEHOLDER_URI)
                         (warnings if allow_placeholders else errors).append(msg)
@@ -711,6 +728,17 @@ def self_test() -> int:
                                           "delta_sharing.endpoint: credential parameter(s) api_key")),
                f"leaked={leaked}\n{err}")
 
+        # Guards must be full-string: `$` would accept a trailing newline.
+        sneaky = ["SECRETVAL\n", "SECRETVAL\r", "SECRET\x07VAL", "\x1b[2J", "SECRETVAL\n\n"]
+        guard_bad = [repr(v) for v in sneaky if shown(v) != "<name not shown>"]
+        guard_bad += [f"{rx.pattern} accepts {v!r}" for rx, v in (
+            (NAME_RE, "dev\n"), (ENV_NAME_RE, "LAKEHOUSE_UC_TOKEN\n"), (SAFE_NAME_RE, "x\n"),
+            (PLACEHOLDER_HOST_RE, "SPARK_HOST\n"), (DNS_LABEL_RE, "broker\n")) if rx.fullmatch(v)]
+        guard_bad += [f"valid_host accepts {h!r}" for h in ("broker\n", "a.b\n", "a..b", ".", "a.b..")
+                      if valid_host(h)]
+        expect("name/host guards are full-string (trailing \\n, \\r, control chars rejected)",
+               not guard_bad, ", ".join(guard_bad))
+
         # (section, key, value, expected stderr fragment). Errors for URI / host:port fields
         # must consist ONLY of the stable templates, and no token of the supplied value
         # (outside that fixed vocabulary) may reach stdout or stderr.
@@ -754,6 +782,15 @@ def self_test() -> int:
             ("kafka", "bootstrap_servers", "a..b:9092", "entry 1: invalid host:port"),
             ("mlflow", "tracking_uri", "http://SECRETVAL..internal/", "invalid URI"),
             ("mlflow", "tracking_uri", "http://[SECRETVAL]:5000/", "invalid URI"),
+            ("kafka", "bootstrap_servers", "a.b..:9092", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", ".:9092", "entry 1: invalid host:port"),
+            ("mlflow", "tracking_uri", "http://mlflow.internal/\nSECRETVAL", "contains control characters"),
+            ("mlflow", "tracking_uri", "http://mlflow\t.internal/SECRETVAL", "contains control characters"),
+            ("mlflow", "tracking_uri", "http://mlflow.internal/\x7fSECRETVAL", "contains control characters"),
+            ("mlflow", "tracking_uri", "http://mlflow.internal/\x1b[2JSECRETVAL", "contains control characters"),
+            ("spark", "connect_uri", "sc://spark.internal:15002/\r;token=SECRETVAL", "contains control characters"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092\nSECRETVAL:9092", "contains control characters"),
+            ("kafka", "bootstrap_servers", "k1.internal\t:9092,SECRETVAL:9092", "contains control characters"),
         ]
         names_rx = "(?:" + "|".join(sorted(SECRET_URI_PARAMS)) + ")"
         schemes_rx = "(?:http:// or https://|sc://|s3:// or s3a://)"
@@ -767,6 +804,7 @@ def self_test() -> int:
 
         value_msgs = (MSG_CRED_PARAMS, MSG_USERINFO, MSG_BAD_URI, MSG_HP_USERINFO, MSG_HP_FORBIDDEN,
                       MSG_BAD_HOSTPORT, MSG_PLACEHOLDER_URI, MSG_PLACEHOLDER_HP)
+        value_msgs += (MSG_CONTROL,)
         templates = [template_rx(t) for t in value_msgs]
         vocab = set(re.findall(r"[a-z0-9]+", " ".join(
             [*value_msgs, "http https sc s3 s3a", " ".join(SECRET_URI_PARAMS),
@@ -774,7 +812,7 @@ def self_test() -> int:
         bad_syntax = []
         for section, key, value, fragment in leak_cases:
             extra = {"object_store": 'kind = "s3"\nbucket = "b"\nwarehouse = "s3://b/w"\n'}.get(section, "")
-            body = f'[profile]\nname = "leak"\ninvocation = "local"\n[{section}]\n{key} = "{value}"\n{extra}'
+            body = f'[profile]\nname = "leak"\ninvocation = "local"\n[{section}]\n{key} = {json.dumps(value)}\n{extra}'
             path = write("leak.profile.toml", body)
             code, out, err = _call(["--file", path], {}, aux)
             field = re.escape(f"{section}.{key}")
@@ -798,10 +836,12 @@ def self_test() -> int:
             ("kafka", "bootstrap_servers", "kafka_broker-1.svc.cluster.local:9092"),
             ("mlflow", "tracking_uri", "http://[::1]:5000"),
             ("mlflow", "tracking_uri", "https://mlflow.internal:65535/api"),
+            ("kafka", "bootstrap_servers", "broker.example.com.:9092"),      # trailing-dot FQDN
+            ("mlflow", "tracking_uri", "https://mlflow.example.com.:5000/"),
         ]
         rejected = []
         for section, key, value in must_pass:
-            body = f'[profile]\nname = "ok"\ninvocation = "local"\n[{section}]\n{key} = "{value}"\n'
+            body = f'[profile]\nname = "ok"\ninvocation = "local"\n[{section}]\n{key} = {json.dumps(value)}\n'
             code, out, err = _call(["--file", write("ok.profile.toml", body)], {}, aux)
             if code != 0:
                 rejected.append(f"{value!r}: code={code} err={err!r}")
@@ -832,6 +872,14 @@ def self_test() -> int:
             ("TOML bad UTF-8", "toml", b'[profile]\nname = "SECRETVAL\xfe"\n', 2, "content not shown"),
             (".env odd variable name", "env", "LAKEHOUSE_PROFILE_NAME=x\nLAKEHOUSE_PROFILE_INVOCATION=local\n"
              "SECRETVAL key=1\n", 0, "<name not shown>"),
+            ("profile name with embedded newline", "toml",
+             '[profile]\nname = "SECRETVAL\\nX"\ninvocation = "local"\n', 1, MSG_BAD_NAME),
+            ("key name ending in newline", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
+             '[spark]\nconnect_uri = "sc://s.internal"\n"SECRETVAL\\n" = 1\n', 0, "<name not shown>"),
+            ("section name ending in CR", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
+             '["SECRETVAL\\r"]\nk = 1\n', 0, "<name not shown>"),
+            ("key name with ESC control", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
+             '[spark]\nconnect_uri = "sc://s.internal"\n"SECRETVAL\\u001b[2J" = 1\n', 0, "<name not shown>"),
             ("unknown section/key names", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
              '["SECRETVAL section"]\nk = 1\n[spark]\nconnect_uri = "sc://s.internal"\n"SECRETVAL key" = 1\n',
              0, "<name not shown>"),
@@ -850,8 +898,34 @@ def self_test() -> int:
         code, out, err = _call([], {"LAKEHOUSE_PROFILE_DIR": cand}, cand)
         if code != 2 or "SECRETVAL" in out + err or "<name not shown>" not in err:
             site_bad.append(f"candidate listing: code={code} err={err!r}")
-        expect(f"{len(site_cases) + 1} other message sites (non-URI fields, file errors, names) never "
+        with open(os.path.join(cand, "c.profile.toml"), "w", encoding="utf-8") as fh:
+            fh.write('[profile]\nname = "SECRETVAL\\nX"\ninvocation = "local"\n')
+        for argv, want_code, fragment in (([], 2, "<name not shown>"),
+                                          (["--profile", "nope"], 2, "<name not shown>"),
+                                          (["--profile", "SECRETVAL\nX"], 1, MSG_BAD_NAME)):
+            code, out, err = _call(argv, {"LAKEHOUSE_PROFILE_DIR": cand}, cand)
+            if code != want_code or "SECRETVAL" in out + err or fragment not in err:
+                site_bad.append(f"candidate (name with newline) {argv}: code={code} err={err!r}")
+        expect(f"{len(site_cases) + 4} other message sites (non-URI fields, file errors, names) never "
                "echo a value", not site_bad, "\n".join(site_bad))
+
+        # Selection matches the unsanitized [profile].name, so valid names of any length stay
+        # selectable and distinct ones never collapse (even past the 255-char display cap).
+        longdir = os.path.join(aux, "long")
+        os.mkdir(longdir)
+        names = {"n65.profile.toml": "p" * 65, "a.profile.toml": "x" * 300 + "-alpha",
+                 "b.profile.toml": "x" * 300 + "-beta"}
+        for fname, pname in names.items():
+            with open(os.path.join(longdir, fname), "w", encoding="utf-8") as fh:
+                fh.write(f'[profile]\nname = "{pname}"\ninvocation = "local"\n')
+        picked = {}
+        for fname, pname in names.items():
+            code, out, err = _call(["--profile", pname], {"LAKEHOUSE_PROFILE_DIR": longdir}, longdir)
+            picked[fname] = (code, os.path.basename(json.loads(out)["_meta"]["source"]) if code == 0 else err)
+        code, out, err = _call(["--list"], {"LAKEHOUSE_PROFILE_DIR": longdir}, longdir)
+        expect("long profile names (65, 306 chars) each selectable via --profile; no collapse; "
+               "65-char name listed in full",
+               all(picked[f] == (0, f) for f in names) and ("p" * 65) in out, f"{picked}\n{out}")
 
         code, out, err = _call(["--file", aux], {}, aux)
         expect("unsupported path (directory without extension) -> exit 2", code == 2, err)

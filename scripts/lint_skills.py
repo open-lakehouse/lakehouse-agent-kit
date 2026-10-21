@@ -41,7 +41,7 @@ CLAUDE_ONLY_KEYS = {
     "when_to_use", "hooks", "model", "argument-hint", "disable-model-invocation",
     "user-invocable", "context", "agent", "paths", "shell", "effort",
 }
-NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")  # always .fullmatch()
 TOP_KEY_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)\s*:(.*)$")
 LINK_RE = re.compile(r"\[\[([^\]\n]+)\]\]")
 
@@ -100,7 +100,7 @@ class Linter:
     def skill_exists(self, slug: str) -> bool:
         """True only for a kebab-case slug whose SKILL.md really lives under skills_dir
         (rejects `../x`, absolute paths, and symlinks pointing outside)."""
-        if not NAME_RE.match(slug):
+        if not NAME_RE.fullmatch(slug):
             return False
         root = os.path.realpath(self.skills_dir)
         target = os.path.realpath(os.path.join(root, slug, "SKILL.md"))
@@ -223,7 +223,7 @@ class Linter:
         else:
             line = fields["name"][0]
             name = self.scalar(fields["name"])
-            if not NAME_RE.match(name) or len(name) > MAX_NAME:
+            if not NAME_RE.fullmatch(name) or len(name) > MAX_NAME:
                 self.report(path, line, "name", f"'{name}' must be kebab-case, <= {MAX_NAME} chars")
             if not dirname.startswith("_") and name != dirname:
                 self.report(path, line, "name", f"'{name}' does not match directory '{dirname}'")
@@ -317,7 +317,7 @@ class Linter:
     def check_links(self, path: str, line: int, text: str) -> None:
         for m in LINK_RE.finditer(text):
             target = m.group(1).split("|", 1)[0].strip()
-            if not NAME_RE.match(target):
+            if not NAME_RE.fullmatch(target):
                 self.report(path, line, "link", f"[[{target}]] is not a kebab-case skill slug")
             elif not self.skill_exists(target):
                 self.report(path, line, "link", f"[[{target}]] does not resolve to skills/{target}/SKILL.md")

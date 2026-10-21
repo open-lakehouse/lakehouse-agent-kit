@@ -22,7 +22,7 @@ DOTTED = r"\d+(?:\.\d+)+"
 # "version" followed (on the same line, within a short phrase) by the dotted number.
 AFTER_WORD_RE = re.compile(r"\bversion\b[^\d\r\n]{0,20}(" + DOTTED + r")", re.I)
 ANY_RE = re.compile(r"(?<![\w.])(" + DOTTED + r")")
-FLOOR_RE = re.compile(r"^\d+(?:\.\d+)*$")
+FLOOR_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
 def extract(text: str):
@@ -70,7 +70,7 @@ def main(argv: list[str]) -> int:
         print(__doc__.split("\n\n", 2)[1], file=sys.stderr)
         return 2
     text, floor = argv
-    if not FLOOR_RE.match(floor.strip()):
+    if not FLOOR_RE.fullmatch(floor.strip()):
         print(f"version_floor: floor {floor!r} must be a dotted number like 4.0 or 3.6.1", file=sys.stderr)
         return 2
     have = extract(text)
