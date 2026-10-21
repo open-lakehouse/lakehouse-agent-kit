@@ -12,12 +12,17 @@ Stdlib-only; run as `python3 -I scripts/lint_skills.py`. Checks:
   size          body <= 500 lines
   portability   no hardcoded `localhost:`, `127.0.0.1`, `sc://localhost`, literal
                 `docker exec <container-name>`, or bare `:PORT` literals
-  links         every [[skill-link]] resolves to an existing skills/<dir>/SKILL.md
+  links         every [[skill-link]] is a kebab-case slug that resolves to an existing
+                skills/<slug>/SKILL.md inside the skills directory (no placeholders)
 
 Directories whose name starts with `_` (e.g. `_template`) are copy-me templates: every
-rule applies except name == directory. A line containing `lint-allow: portability`
-(e.g. in an HTML comment) is exempt from the portability rules — use sparingly, for
-documented anti-pattern examples only.
+rule applies except name == directory.
+
+Suppression: a line consisting only of the HTML comment
+    <!-- lint-allow: <rule>[,<rule>...] -- <justification, >= 10 chars> -->
+exempts the NEXT line from the named portability rule(s) only. Any other use of
+`lint-allow` (inline, unknown rule, missing justification, nothing following) is itself
+a violation. Reserve it for deliberate anti-pattern examples.
 
 Exit status: 0 clean, 1 violations found, 2 usage error.
 """
@@ -44,7 +49,10 @@ MAX_DESCRIPTION = 1536
 MAX_COMPATIBILITY = 500
 MAX_NAME = 64
 MAX_BODY_LINES = 500
-ALLOW_MARKER = "lint-allow: portability"
+PORTABILITY_RULES = ("sc-localhost", "loopback-ip", "localhost", "docker-exec", "bare-port")
+ALLOW_RE = re.compile(
+    r"^\s*<!--\s*lint-allow:\s*([a-z-]+(?:\s*,\s*[a-z-]+)*)\s+--\s+(.*?)\s*-->\s*$")
+MIN_JUSTIFICATION = 10
 
 # Portability rules, in priority order. A later match that overlaps an earlier one on
 # the same line is suppressed so one endpoint yields one message.
@@ -59,11 +67,19 @@ HOST_RULES = (
 DOCKER_EXEC_RE = re.compile(r"\bdocker\s+(?:container\s+)?exec\b")
 # Options of `docker exec` that consume the following token as their value.
 DOCKER_VALUE_OPTS = {"-u", "--user", "-e", "--env", "-w", "--workdir", "--env-file", "--detach-keys"}
-# `:PORT` = colon + 2-5 digits not preceded by a digit (times, ratios), `[` (slices) or
-# `:`, and not followed by a word char or `.x` (versions). File line refs (`foo.py:12`) are skipped below.
-PORT_RE = re.compile(r"(?<![\d\[:]):(\d{2,5})(?!\w)(?!\.\w)")
+# `:PORT` = colon + 1-5 digits not preceded by a digit (times, ratios), `[` (slices) or
+# `:`, and not followed by a word char or `.x` (versions).
+PORT_RE = re.compile(r"(?<![\d\[:]):(\d{1,5})(?!\w)(?!\.\w)")
+# The token directly before the colon; used to skip colon-number identifiers that are
+# not host:port — file line refs (`foo.py:42`) and labels like `RFC:7231`, `PR:456`.
+PREFIX_TOKEN_RE = re.compile(r"([\w.#/-]*)$")
 FILE_REF_RE = re.compile(
-    r"\.(?:py|md|sh|toml|env|json|ya?ml|txt|sql|scala|java|kt|ts|js|go|rs|cfg|ini|conf):$")
+    r"\.(?:py|md|sh|toml|env|json|ya?ml|txt|sql|scala|java|kt|ts|js|go|rs|cfg|ini|conf)$")
+NON_PORT_LABELS = {
+    "rfc", "pr", "prs", "pull", "issue", "issues", "bug", "cve", "ticket", "jira", "gh",
+    "line", "lines", "step", "phase", "page", "section", "sec", "chapter", "item", "task",
+    "spark", "kafka", "flip", "kip", "pep", "sip", "spip", "v", "version",
+}
 
 
 class Linter:
@@ -82,12 +98,23 @@ class Linter:
         )
 
     def skill_exists(self, slug: str) -> bool:
-        return os.path.isfile(os.path.join(self.skills_dir, slug, "SKILL.md"))
+        """True only for a kebab-case slug whose SKILL.md really lives under skills_dir
+        (rejects `../x`, absolute paths, and symlinks pointing outside)."""
+        if not NAME_RE.match(slug):
+            return False
+        root = os.path.realpath(self.skills_dir)
+        target = os.path.realpath(os.path.join(root, slug, "SKILL.md"))
+        return os.path.commonpath([root, target]) == root and os.path.isfile(target)
 
     def run(self) -> int:
         dirs = self.skill_dirs()
+        root = os.path.realpath(self.skills_dir)
         for d in dirs:
             path = os.path.join(self.skills_dir, d, "SKILL.md")
+            if os.path.commonpath([root, os.path.realpath(os.path.join(root, d))]) != root:
+                self.report(os.path.join(self.skills_dir, d), 0, "link",
+                            "skill directory is a symlink that resolves outside skills/")
+                continue
             if not os.path.isfile(path):
                 self.report(os.path.join(self.skills_dir, d), 0, "missing-skill-md",
                             "skill directory has no SKILL.md")
@@ -114,10 +141,36 @@ class Linter:
             self.report(path, end + 2, "size",
                         f"body is {body_lines} lines (> {MAX_BODY_LINES}); move depth into references/")
 
+        allowed: set[str] = set()  # rules suppressed for the current line
         for idx, text in enumerate(lines, start=1):
-            if ALLOW_MARKER not in text:
-                self.check_portability(path, idx, text)
+            next_allowed = self.parse_allow(path, idx, text, lines)
+            self.check_portability(path, idx, text, allowed)
             self.check_links(path, idx, text)
+            allowed = next_allowed
+
+    def parse_allow(self, path: str, line: int, text: str, lines: list[str]) -> set[str]:
+        """Validate a `lint-allow` comment; return the rules it suppresses on the next line."""
+        if "lint-allow" not in text:
+            return set()
+        m = ALLOW_RE.match(text)
+        if not m:
+            self.report(path, line, "lint-allow", "must be a standalone line "
+                        "'<!-- lint-allow: <rule>[,<rule>] -- <justification> -->'")
+            return set()
+        rules = {r.strip() for r in m.group(1).split(",")}
+        unknown = sorted(rules - set(PORTABILITY_RULES))
+        if unknown:
+            self.report(path, line, "lint-allow", f"unknown rule(s) {', '.join(unknown)}; "
+                        f"allowed: {', '.join(PORTABILITY_RULES)}")
+            return set()
+        if len(m.group(2).strip()) < MIN_JUSTIFICATION:
+            self.report(path, line, "lint-allow",
+                        f"justification after '--' must be at least {MIN_JUSTIFICATION} chars")
+            return set()
+        if line >= len(lines) or not lines[line].strip():
+            self.report(path, line, "lint-allow", "must be followed by the line it exempts")
+            return set()
+        return rules
 
     def parse_frontmatter(self, path: str, lines: list[str], end: int) -> dict:
         """Minimal top-level YAML reader: key -> (line_no, scalar_text, child_lines)."""
@@ -198,12 +251,17 @@ class Linter:
                 m = re.match(r"^parent\s*:\s*(.*)$", child)
                 if m:
                     parent = m.group(1).strip().strip("\"'")
-                    if not self.skill_exists(parent):
+                    if not self.skill_exists(parent):  # also rejects non-slug / traversal
                         self.report(path, line, "metadata",
                                     f"metadata.parent '{parent}' is not an existing skill")
 
-    def check_portability(self, path: str, line: int, text: str) -> None:
+    def check_portability(self, path: str, line: int, text: str, allowed: set[str]) -> None:
         taken: list[tuple[int, int]] = []
+        report = self.report
+
+        def emit(p, ln, rule, msg):
+            if rule not in allowed:
+                report(p, ln, rule, msg)
 
         def free(start: int, end: int) -> bool:
             return all(end <= s or start >= e for s, e in taken)
@@ -212,24 +270,30 @@ class Linter:
             for m in rx.finditer(text):
                 if free(m.start(), m.end()):
                     taken.append((m.start(), m.end()))
-                    self.report(path, line, rule, f"{msg}: {m.group(0)!r}")
+                    emit(path, line, rule, f"{msg}: {m.group(0)!r}")
 
         for m in DOCKER_EXEC_RE.finditer(text):
             target = self.docker_target(text[m.end():])
             if target is not None:
                 taken.append((m.start(), m.end()))
-                self.report(path, line, "docker-exec",
+                emit(path, line, "docker-exec",
                             f"literal container name in `docker exec {target}`; use the profile's "
                             "<section>.container (e.g. \"$LAKEHOUSE_SPARK_CONTAINER\")")
 
         for m in PORT_RE.finditer(text):
             port = m.group(1)
-            if not (0 < int(port) <= 65535) or FILE_REF_RE.search(text[: m.start() + 1]):
+            if not (0 < int(port) <= 65535) or self.not_a_port(text[: m.start()]):
                 continue
             if free(m.start(), m.end()):
                 taken.append((m.start(), m.end()))
-                self.report(path, line, "bare-port",
+                emit(path, line, "bare-port",
                             f"hardcoded port ':{port}'; ports come from lakehouse profile endpoints")
+
+    @staticmethod
+    def not_a_port(before: str) -> bool:
+        """True when the token before `:N` marks an identifier, not a host."""
+        token = PREFIX_TOKEN_RE.search(before).group(1)
+        return bool(FILE_REF_RE.search(token)) or token.lstrip("#").lower() in NON_PORT_LABELS
 
     @staticmethod
     def docker_target(rest: str):
@@ -253,9 +317,9 @@ class Linter:
     def check_links(self, path: str, line: int, text: str) -> None:
         for m in LINK_RE.finditer(text):
             target = m.group(1).split("|", 1)[0].strip()
-            if target.startswith("<"):  # documented placeholder, e.g. [[<related-skill>]]
-                continue
-            if not self.skill_exists(target):
+            if not NAME_RE.match(target):
+                self.report(path, line, "link", f"[[{target}]] is not a kebab-case skill slug")
+            elif not self.skill_exists(target):
                 self.report(path, line, "link", f"[[{target}]] does not resolve to skills/{target}/SKILL.md")
 
 
@@ -276,7 +340,10 @@ allowed-tools: [Bash, Read]
 Run `docker exec -it "$LAKEHOUSE_SPARK_CONTAINER" spark-sql` or `docker exec` / k8s.
 docker exec -u root <container> bash
 At 10:30 on 2026-10-21T10:30:00, slice x[:10], ratio 1:10, see load_profile.py:42.
-Endpoint "$LAKEHOUSE_KAFKA_BOOTSTRAP_SERVERS". See [[other-skill]] and [[<related-skill>]].
+Per RFC:7231, PR:456, issue:123, #issue:9, KIP:848 and Spark:4.0.1 nothing here is a port.
+Endpoint "$LAKEHOUSE_KAFKA_BOOTSTRAP_SERVERS". See [[other-skill]] and `planned-skill`.
+<!-- lint-allow: localhost,bare-port -- deliberate anti-pattern shown to readers -->
+Never write localhost:8081 in a skill; read [unity_catalog].rest_url instead.
 """
 
 BAD = """---
@@ -289,28 +356,45 @@ metadata:
 
 Connect to sc://localhost:15002 and localhost:8081 and 127.0.0.1:9000.
 docker exec kafka kafka-topics.sh --list
-UC on uc-server:8080, also :9092. See [[missing-skill]].
+UC on uc-server:8080, also :9092, and http://web:8/ (one-digit port).
+See [[missing-skill]], [[<related-skill>]], [[../outside-skill]], [[linked-skill]].
+Inline exemption localhost:8081 <!-- lint-allow: localhost -- not a standalone line -->
+<!-- lint-allow: localhost -- -->
+localhost:7000 stays flagged because the justification above is empty.
+<!-- lint-allow: everything -- unknown rule names are rejected -->
+<!-- lint-allow: bare-port -- only the named rule is suppressed -->
+Suppressed port uc:9000 but localhost:9001 is still flagged.
 """
 
 BAD_EXPECT = {
-    "name": 1, "frontmatter-key": 1, "metadata": 1, "sc-localhost": 1, "localhost": 1,
-    "loopback-ip": 1, "docker-exec": 1, "bare-port": 2, "link": 1,
+    "name": 1, "frontmatter-key": 1, "metadata": 1, "sc-localhost": 1, "localhost": 4,
+    "loopback-ip": 1, "docker-exec": 1, "bare-port": 3, "link": 4, "lint-allow": 3,
 }
 
 
 def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
+        # A real skill outside the skills dir, reachable only via `../` traversal.
+        os.makedirs(os.path.join(tmp, "outside-skill"))
+        with open(os.path.join(tmp, "outside-skill", "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write(GOOD.replace("good-skill", "outside-skill"))
+        tmp = os.path.join(tmp, "skills")
         for slug, text in (("good-skill", GOOD), ("other-skill", GOOD.replace("good-skill", "other-skill")),
                            ("bad-skill", BAD)):
             os.makedirs(os.path.join(tmp, slug))
             with open(os.path.join(tmp, slug, "SKILL.md"), "w", encoding="utf-8") as fh:
                 fh.write(text)
+        # A symlinked skill dir escaping the skills dir must neither lint nor resolve.
+        os.symlink(os.path.join(tmp, "..", "outside-skill"), os.path.join(tmp, "linked-skill"))
         linter = Linter(tmp)
         linter.run()
     failures = []
     good = [v for v in linter.violations if "/good-skill/" in v or "/other-skill/" in v]
     if good:
         failures.append("spurious flags on clean skill:\n  " + "\n  ".join(good))
+    escaped = [v for v in linter.violations if "/linked-skill:0: [link]" in v]
+    if len(escaped) != 1:
+        failures.append(f"symlinked skill dir escaping skills/ not reported exactly once: {escaped}")
     counts: dict[str, int] = {}
     for v in linter.violations:
         if "/bad-skill/" in v:
@@ -323,7 +407,7 @@ def self_test() -> int:
     if failures:
         return 1
     print("self-test OK: clean fixture has 0 flags; bad fixture flags "
-          f"{sum(BAD_EXPECT.values())} expected violations")
+          f"{sum(BAD_EXPECT.values())} expected violations; escaping symlink dir rejected")
     return 0
 
 

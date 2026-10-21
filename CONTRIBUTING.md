@@ -66,6 +66,17 @@ python3 -I scripts/lint_skills.py
 It enforces the rules above with `file:line` messages: portable frontmatter only,
 `name` == directory, description/compatibility/body limits, no hardcoded `localhost:`,
 `127.0.0.1`, `sc://localhost`, literal `docker exec <container>`, or `:PORT` literals,
-and every `[[skill-link]]` must resolve. Link only to skills that already exist; name
-planned ones in backticks. A line containing `lint-allow: portability` is exempt from the
-portability rules — reserve it for deliberate anti-pattern examples.
+and every `[[skill-link]]` must be a skill slug that resolves to an existing
+`skills/<slug>/` (no placeholders, no paths). Link only to skills that already exist;
+name planned ones in backticks.
+
+To show a deliberate anti-pattern, put a standalone comment on the line **before** it,
+naming the rule(s) and why:
+
+```markdown
+<!-- lint-allow: localhost -- shows readers the hardcoded form to avoid -->
+```
+
+It exempts only the next line and only the named rules (`sc-localhost`, `loopback-ip`,
+`localhost`, `docker-exec`, `bare-port`); a malformed, inline, or unjustified
+`lint-allow` is itself a violation.

@@ -36,7 +36,7 @@ verify the tool version floor before running anything here.
 
 ## See also
 
-- [[lakehouse-core]], [[<related-skill>]]
+- [[lakehouse-core]], `<related-skill>` (switch to a double-bracket link only once that skill exists)
 
 <!--
 Depth goes in references/<topic>.md and scripts/, loaded on demand. Keep this file

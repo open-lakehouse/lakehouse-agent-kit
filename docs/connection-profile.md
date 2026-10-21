@@ -42,8 +42,9 @@ eval "$(python3 -I skills/lakehouse-core/scripts/load_profile.py --profile dev -
 Lists are comma-separated (`LAKEHOUSE_NAMING_SCHEMAS=bronze,silver,gold`); booleans are
 `true`/`false` (`1`/`0`, `yes`/`no` also accepted).
 
-In both formats an **empty string means unset**, and a section whose values are all
-empty is treated as absent.
+In both formats an **empty or whitespace-only value means unset** (strings are trimmed
+before any check, so `"   "` cannot satisfy a required key), and a section whose values
+are all blank is treated as absent.
 
 ## Selecting a profile — and never guessing
 
@@ -174,7 +175,10 @@ optional; use `load_profile.py --require a,b` to make sections mandatory for a t
 Profiles never contain secrets. Credential fields end in `_env` and hold the **name** of an
 environment variable (must match `[A-Z_][A-Z0-9_]*`). Keys that look like inline secrets
 (`token`, `password`, `secret`, `secret_key`, `access_key`, `bearer_token`, `api_key`) are
-rejected. The loader reports each referenced variable as `set` / `unset` in
+rejected, as are credentials embedded in any URI or `host:port` field — userinfo
+(`https://user:pass@host`, `user@host:port`) or credential parameters such as
+`?token=`, `?api_key=`, `X-Amz-Signature=`, or Spark Connect's `;token=`. Error messages
+mask such values. The loader reports each referenced variable as `set` / `unset` in
 `_meta.secrets` and never prints a value.
 
 ## Invocation modes
@@ -214,7 +218,7 @@ Unknown sections and keys produce warnings (forward compatibility), not errors.
 |---|---|
 | `0` | valid; normalized output on stdout |
 | `1` | invalid profile; problems on stderr |
-| `2` | no or ambiguous selection, unreadable file, or usage error |
+| `2` | no or ambiguous selection; unreadable file (missing, directory, permission denied, not UTF-8, invalid TOML); usage error (e.g. unknown `--require` section) |
 
 ## Output
 

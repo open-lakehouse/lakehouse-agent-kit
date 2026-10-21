@@ -87,11 +87,12 @@ The loader validates as it loads. Exit codes:
 |---|---|---|
 | `0` | valid — normalized JSON (or `export` lines) on stdout | continue |
 | `1` | invalid profile — every problem listed on stderr as `section.key: …` | show the list to the user; ask them to fix the file/env; do not patch values yourself |
-| `2` | no / ambiguous selection, unreadable file, or usage error | ask the user to choose (see §1) |
+| `2` | no / ambiguous selection, unreadable file, or usage error | ask the user to choose (see §1), or to fix the file path / permissions named in the message |
 
 What it checks:
 
 - `[profile]` is required: `name` and `invocation` (`local` \| `docker` \| `k8s`).
+  Values are trimmed first; blank values count as unset.
 - Every other section is optional, but a section that is present must have its required
   keys (e.g. `[spark].connect_uri`, `[kafka].bootstrap_servers`,
   `[unity_catalog].rest_url`). A section whose values are all empty counts as absent.
@@ -100,8 +101,9 @@ What it checks:
 - URI shapes (`sc://` for Spark Connect, `http(s)://`, `s3://`/`s3a://` warehouses,
   `host:port` lists for Kafka) and port ranges.
 - Unfilled template placeholders (`SPARK_HOST`, `UC_HOST`, …) are errors.
-- No inline secrets: keys like `token`/`password`/`secret_key` are rejected; credentials
-  are referenced by env-var **name** via `*_env` keys.
+- No inline secrets: keys like `token`/`password`/`secret_key`, URI userinfo
+  (`user:pass@`), and credential URI parameters (`?token=`, `;token=`) are rejected;
+  credentials are referenced by env-var **name** via `*_env` keys.
 - Invocation requirements: `docker` needs the section's `container`, `k8s` needs its
   `pod` plus `[k8s].namespace`.
 
@@ -154,15 +156,17 @@ spark-submit >= X.Y"). Before the first engine command in a session:
 3. Compare. Absent ⇒ tell the user how to install it. Present-but-too-old ⇒ tell the user
    to upgrade and **stop** — do not work around a version gap silently.
 
-```bash
-# version_ge <have> <need>  -> success when have >= need (dotted numeric versions)
-version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+`scripts/version_floor.py` does the comparison in stdlib Python (portable — no GNU
+`sort -V`). Pass it the raw `--version` output; it extracts the version itself:
 
-have=$(lh_exec spark spark-submit --version 2>&1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n1)
-need="<floor from the product skill's compatibility>"
-if [ -z "$have" ]; then echo "spark-submit not found via invocation=$LAKEHOUSE_SPARK_INVOCATION"
-elif ! version_ge "$have" "$need"; then echo "spark-submit $have < required $need — upgrade first"; fi
+```bash
+python3 -I scripts/version_floor.py "$(lh_exec spark spark-submit --version 2>&1)" "<floor from compatibility>"
+# exit 0: OK (have >= floor)   1: TOO OLD — tell the user to upgrade, stop
+# exit 2: no version found (tool missing / not reachable via this invocation mode) or bad floor
 ```
+
+Comparison is numeric per component (`2.21` > `2.9`, `4.0` == `4.0.0`); a pre-release
+suffix compares as its release.
 
 Version commands (run via `lh_exec <section> …`):
 
@@ -217,4 +221,5 @@ and are opt-in.
 ## See also
 
 - `scripts/load_profile.py --help` for every flag; `--self-test` to check the loader.
+- `scripts/version_floor.py --self-test` to check the version comparison.
 - `docs/connection-profile.md` for the field-by-field reference.

@@ -71,6 +71,13 @@ INLINE_SECRET_KEYS = {"token", "password", "secret", "secret_key", "access_key",
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLACEHOLDER_HOST_RE = re.compile(r"^[A-Z][A-Z0-9_]*_HOST$")
+# Query / `;param=` names that carry credentials (compared lower-case, `-` -> `_`).
+SECRET_URI_PARAMS = {
+    "token", "access_token", "session_token", "bearer", "auth", "authorization", "password",
+    "passwd", "pwd", "secret", "client_secret", "api_key", "apikey", "key", "credential",
+    "sig", "signature", "x_amz_signature", "x_amz_credential", "x_amz_security_token",
+}
+URI_PARAM_RE = re.compile(r"([;?&])([A-Za-z0-9_.-]+)=([^;&#]*)")
 
 
 class ProfileError(Exception):
@@ -86,11 +93,11 @@ def read_toml(path: str) -> dict:
     if tomllib is None:
         raise ProfileError(f"{path}: reading TOML needs Python >= 3.11 (tomllib); "
                            "use the .env profile variant on older interpreters")
-    try:
-        with open(path, "rb") as fh:
+    with open(path, "rb") as fh:
+        try:
             return tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
-        raise ProfileError(f"{path}: invalid TOML: {exc}") from None
+        except tomllib.TOMLDecodeError as exc:
+            raise ProfileError(f"{path}: invalid TOML: {exc}") from None
 
 
 def split_env_name(name: str):
@@ -144,14 +151,23 @@ def env_to_sections(env: dict[str, str], warnings: list[str], strict_origin: str
 
 
 def read_profile_file(path: str, warnings: list[str]) -> dict:
-    if not os.path.isfile(path):
+    """Read a profile file. Every read/decode failure becomes a ProfileError (exit 2)."""
+    if not path.endswith((".toml", ".env")):
+        raise ProfileError(f"{path}: unsupported profile format (expected .toml or .env)")
+    if os.path.isdir(path):
+        raise ProfileError(f"{path}: is a directory, not a profile file")
+    if not os.path.exists(path):
         raise ProfileError(f"profile file not found: {path}")
-    if path.endswith(".toml"):
-        return read_toml(path)
-    if path.endswith(".env"):
+    try:
+        if path.endswith(".toml"):
+            return read_toml(path)
         with open(path, encoding="utf-8") as fh:
-            return env_to_sections(parse_env_lines(fh.read(), path), warnings, strict_origin=path)
-    raise ProfileError(f"{path}: unsupported profile format (expected .toml or .env)")
+            text = fh.read()
+    except UnicodeError as exc:
+        raise ProfileError(f"{path}: not valid UTF-8 ({exc})") from None
+    except OSError as exc:
+        raise ProfileError(f"{path}: cannot read profile file: {exc.strerror or exc}") from None
+    return env_to_sections(parse_env_lines(text, path), warnings, strict_origin=path)
 
 
 # -- discovery / selection -------------------------------------------------------------
@@ -233,6 +249,20 @@ def hosts_of(kind: str, value: str) -> list[str]:
     return [netloc.split(":", 1)[0]]
 
 
+def uri_secret_params(tail: str) -> list[str]:
+    return [m.group(2) for m in URI_PARAM_RE.finditer(tail)
+            if m.group(2).lower().replace("-", "_") in SECRET_URI_PARAMS]
+
+
+def redact(value: str) -> str:
+    """Mask userinfo and credential-like params so error messages never echo secrets."""
+    value = re.sub(r"(//)[^/@]*@", r"\1***@", value) if "//" in value else \
+        re.sub(r"(^|,)\s*[^,@]*@", r"\1***@", value)
+    return URI_PARAM_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}=***"
+        if m.group(2).lower().replace("-", "_") in SECRET_URI_PARAMS else m.group(0), value)
+
+
 def check_value(where: str, kind: str, value, errors: list[str]):
     """Validate and normalize one value. Returns the normalized value (or None)."""
     if kind == "bool":
@@ -279,15 +309,34 @@ def check_value(where: str, kind: str, value, errors: list[str]):
         except ValueError:
             ok = False
         if not ok:
-            errors.append(f"{where}: {value!r} must be a {'/'.join(s + '://' for s in schemes)} URI")
+            errors.append(f"{where}: {redact(value)!r} must be a "
+                          f"{' or '.join(s + '://' for s in schemes)} URI")
+        if "@" in u.netloc:
+            errors.append(f"{where}: credentials in URI userinfo (user:password@) are not allowed; "
+                          "reference them by env-var name via a *_env key")
+        tail = value.split(u.netloc, 1)[1] if u.netloc else value
+        bad = uri_secret_params(tail)
+        if bad:
+            errors.append(f"{where}: credential parameter(s) {', '.join(sorted(set(bad)))} are not "
+                          "allowed in the URI; reference secrets by env-var name via a *_env key")
     elif kind == "hostports":
         parts = [p.strip() for p in value.split(",") if p.strip()]
         for p in parts:
             host, _, port = p.rpartition(":")
-            if not host or not port.isdigit() or not 0 < int(port) <= 65535:
+            if "@" in p:
+                errors.append(f"{where}: credentials (user@) are not allowed in host:port entries")
+            elif not host or not port.isdigit() or not 0 < int(port) <= 65535:
                 errors.append(f"{where}: {p!r} must be host:port")
         value = ",".join(parts)
     return value
+
+
+def is_blank(value) -> bool:
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return all(isinstance(i, str) and not i.strip() for i in value)
+    return False
 
 
 def validate(raw: dict, require: list[str], allow_placeholders: bool,
@@ -306,8 +355,9 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
                               f"{section}.{key}_env to the NAME of an env var instead")
             elif key not in SCHEMA[section]:
                 warnings.append(f"ignoring unknown key {section}.{key}")
-        # Empty strings mean unset; a section with nothing set is treated as absent.
-        present = {k: v for k, v in body.items() if k in SCHEMA[section] and v != ""}
+        # Blank (empty/whitespace-only) strings and lists mean unset; a section with
+        # nothing set is treated as absent.
+        present = {k: v for k, v in body.items() if k in SCHEMA[section] and not is_blank(v)}
         if not present and section != "profile":
             continue
         norm: dict = {}
@@ -319,6 +369,8 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
                 norm[key] = None
                 continue
             norm[key] = check_value(f"{section}.{key}", kind, present[key], errors)
+            if required and norm[key] in ("", []):
+                errors.append(f"{section}.{key}: required value is empty")
             if kind in ("http_url", "sc_uri", "hostports") and isinstance(norm[key], str):
                 for host in hosts_of(kind, norm[key]):
                     if PLACEHOLDER_HOST_RE.match(host):
@@ -345,10 +397,8 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
                 errors.append(f"{section}.pod: required when invocation is 'k8s'")
     if needs_ns and not (out.get("k8s") or {}).get("namespace"):
         errors.append("k8s.namespace: required when any invocation is 'k8s'")
-    for section in require:
-        if section not in SCHEMA:
-            errors.append(f"--require: unknown section '{section}' (known: {', '.join(SCHEMA)})")
-        elif section not in out:
+    for section in require:  # names already checked in run()
+        if section not in out:
             errors.append(f"[{section}] is required by the calling skill but is not configured")
     return out
 
@@ -397,6 +447,13 @@ def run(argv: list[str], environ: dict, cwd: str, home: str) -> int:
         print(candidates_text(discover(environ, cwd, home), search_dirs(environ, cwd, home)))
         return 0
 
+    require = [s.strip() for s in args.require.split(",") if s.strip()]
+    unknown = [s for s in require if s not in SCHEMA]
+    if unknown:
+        print(f"load_profile: --require: unknown section(s) {', '.join(unknown)} "
+              f"(known: {', '.join(SCHEMA)})", file=sys.stderr)
+        return 2
+
     warnings: list[str] = []
     try:
         path, selected_by = select(args, environ, cwd, home)
@@ -415,7 +472,6 @@ def run(argv: list[str], environ: dict, cwd: str, home: str) -> int:
                 overrides.append(env_var(section, key))
 
     errors: list[str] = []
-    require = [s.strip() for s in args.require.split(",") if s.strip()]
     profile = validate(raw, require, args.allow_placeholders, errors, warnings)
     for w in warnings:
         print(f"load_profile: warning: {w}", file=sys.stderr)
@@ -468,6 +524,36 @@ container = "kafka"
 rest_url = "http://UC_HOST:8080/api/2.1/unity-catalog"
 token = "s3cr3t"
 """
+BLANK_TOML = """
+[profile]
+name = "blank"
+invocation = "local"
+[kafka]
+bootstrap_servers = "   "
+container = "k"
+[object_store]
+kind = "s3"
+s3_endpoint = "https://s3.internal"
+bucket = "   "
+warehouse = "s3://wh/root"
+[mlflow]
+tracking_uri = "   "
+"""
+USERINFO_TOML = """
+[profile]
+name = "leaky"
+invocation = "local"
+[unity_catalog]
+rest_url = "https://alice:hunter2pw@uc.internal/api/2.1/unity-catalog"
+[mlflow]
+tracking_uri = "http://bob@mlflow.internal:5000"
+[spark]
+connect_uri = "sc://spark.internal:15002/;user_id=me;token=tok3nvalue"
+[kafka]
+bootstrap_servers = "carol:kafkapw@k1.internal:9092"
+[delta_sharing]
+endpoint = "https://share.internal/delta-sharing?api_key=k3yvalue"
+"""
 
 
 def _call(argv, environ, cwd):
@@ -519,6 +605,68 @@ def self_test() -> int:
 
         code, out, err = _call(["--profile", "nope"], dict(base), tmp)
         expect("unknown --profile -> exit 2 with candidates", code == 2 and "dev" in err, err)
+
+        code, out, err = _call(["--profile", "dev", "--require", "spark,nosuch"], dict(base), tmp)
+        expect("--require unknown section -> exit 2 (usage)", code == 2 and "nosuch" in err, err)
+
+        # Separate dir so these fixtures don't appear in discovery for the cases above.
+        aux = os.path.join(tmp, "aux")
+        os.mkdir(aux)
+
+        def write(name, data):
+            path = os.path.join(aux, name)
+            with open(path, "wb") as fh:
+                fh.write(data.encode() if isinstance(data, str) else data)
+            return path
+
+        code, out, err = _call(["--file", write("blank.profile.toml", BLANK_TOML)], {}, aux)
+        expect("whitespace-only required values -> exit 1",
+               code == 1 and all(k in err for k in ("kafka.bootstrap_servers", "object_store.bucket"))
+               and "mlflow" not in err, err)
+        code, out, err = _call(["--file", "blank.profile.toml", "--require", "mlflow"], {}, aux)
+        expect("whitespace-only section counts as absent under --require",
+               code == 1 and "[mlflow] is required" in err, err)
+        code, out, err = _call(["--profile", "dev"], dict(base, LAKEHOUSE_SPARK_CONNECT_URI="  "), tmp)
+        expect("whitespace-only env override unsets a required key -> exit 1",
+               code == 1 and "spark.connect_uri: required key is missing" in err, err)
+
+        code, out, err = _call(["--file", write("leaky.profile.toml", USERINFO_TOML)], {}, aux)
+        leaked = [v for v in ("hunter2pw", "kafkapw", "tok3nvalue", "k3yvalue", "alice", "carol")
+                  if v in out + err]
+        expect("URI userinfo / credential params rejected in every URI field, never echoed",
+               code == 1 and not leaked and out == ""
+               and all(k in err for k in ("unity_catalog.rest_url: credentials in URI userinfo",
+                                          "mlflow.tracking_uri: credentials in URI userinfo",
+                                          "spark.connect_uri: credential parameter(s) token",
+                                          "kafka.bootstrap_servers: credentials",
+                                          "delta_sharing.endpoint: credential parameter(s) api_key")),
+               f"leaked={leaked}\n{err}")
+
+        code, out, err = _call(["--file", aux], {}, aux)
+        expect("unsupported path (directory without extension) -> exit 2", code == 2, err)
+        os.mkdir(os.path.join(aux, "dir.profile.toml"))
+        code, out, err = _call(["--file", "dir.profile.toml"], {}, aux)
+        expect("directory named *.profile.toml -> exit 2 'is a directory'",
+               code == 2 and "is a directory" in err and "Traceback" not in err, err)
+        for name in ("bad-utf8.profile.toml", "bad-utf8.profile.env"):
+            body = b"[profile]\nname = \"\xff\xfe\"\n" if name.endswith(".toml") else b"LAKEHOUSE_PROFILE_NAME=\xff\n"
+            code, out, err = _call(["--file", write(name, body)], {}, aux)
+            expect(f"invalid UTF-8 ({name.rsplit('.', 1)[1]}) -> exit 2 naming the path",
+                   code == 2 and "not valid UTF-8" in err and name in err, err)
+        locked = write("locked.profile.env", "LAKEHOUSE_PROFILE_NAME=x\n")
+        os.chmod(locked, 0)
+        try:
+            if os.access(locked, os.R_OK):  # e.g. running as root
+                print("  skip unreadable-file case (file still readable as this user)")
+            else:
+                code, out, err = _call(["--file", locked], {}, aux)
+                expect("unreadable file -> exit 2 'cannot read' naming the path",
+                       code == 2 and "cannot read profile file" in err and locked in err, err)
+                code, out, err = _call(["--list"], {"LAKEHOUSE_PROFILE_DIR": aux}, aux)
+                expect("--list survives unreadable / undecodable candidates",
+                       code == 0 and "<unreadable:" in out, out + err)
+        finally:
+            os.chmod(locked, 0o600)
 
         # When run from a repo checkout, both shipped templates must validate and agree.
         repo_templates = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "templates")
