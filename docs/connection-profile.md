@@ -179,8 +179,14 @@ rejected, as are credentials embedded in any URI or `host:port` field — userin
 (`https://user:pass@host`, `user@host:port`) or credential parameters such as
 `?token=`, `?api_key=`, `X-Amz-Signature=`, `aws_access_key_id=`, or Spark Connect's
 `;token=` (names are percent-decoded before matching). `host:port` fields additionally
-reject `? ; & # /` outright. Errors name the field, entry, and parameter **names** only —
-URI and `host:port` values are never echoed. The loader reports each referenced variable as `set` / `unset` in
+reject `? ; & # /` outright and require a plain hostname / IPv4 / bracketed IPv6 host, so
+`user:pass:9092` is rejected rather than accepted as host `user:pass`. Ports must be
+1–65535 (port `0` is rejected) in both URI and `host:port` fields.
+
+Errors for URI and `host:port` fields use fixed messages containing only the field name,
+the entry number, and **canonical** parameter names from the loader's own list (e.g.
+`x_amz_signature`, never the user's spelling). No part of the supplied value — not the
+scheme, host, port, or parameter values — is ever echoed. The loader reports each referenced variable as `set` / `unset` in
 `_meta.secrets` and never prints a value.
 
 ## Invocation modes

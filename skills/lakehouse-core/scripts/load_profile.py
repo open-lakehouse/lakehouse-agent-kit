@@ -83,6 +83,18 @@ SECRET_URI_PARAMS = {
 URI_PARAM_RE = re.compile(r"([;?&#])([A-Za-z0-9_.%-]+)=([^;&#]*)")
 # Characters that never belong in a host:port entry (they start params / userinfo).
 HOSTPORT_FORBIDDEN = set("@?;&#/")
+# A host:port host: DNS name / IPv4 (underscores allowed for *_HOST placeholders) or a
+# bracketed IPv6 literal. Anything else — notably an extra `:` as in `user:pass:9092` —
+# is rejected so it can never reach the output.
+HOSTPORT_HOST_RE = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)$")
+# Stable error texts for URI / host:port fields. They contain no part of the supplied
+# value: only the field name, an entry number, and canonical names from SECRET_URI_PARAMS.
+MSG_CRED_PARAMS = "credential parameter(s) {names} are not allowed; reference secrets by env-var name via a *_env key"
+MSG_USERINFO = "credentials in URI userinfo (user:password@) are not allowed; reference them by env-var name via a *_env key"
+MSG_BAD_URI = "invalid URI (expected {schemes} with a host and an optional port 1-65535; value not shown)"
+MSG_HP_USERINFO = "entry {n}: credentials (user@) are not allowed in host:port"
+MSG_HP_FORBIDDEN = "entry {n}: invalid host:port (characters ? ; & # / are not allowed; value not shown)"
+MSG_BAD_HOSTPORT = "entry {n}: invalid host:port (expected host:port with port 1-65535; value not shown)"
 
 
 class ProfileError(Exception):
@@ -258,22 +270,20 @@ def hosts_of(kind: str, value: str) -> list[str]:
     return [netloc.split(":", 1)[0]]
 
 
-def is_secret_param(name: str) -> bool:
-    return unquote(name).lower().replace("-", "_") in SECRET_URI_PARAMS
+def canonical_param(name: str) -> str:
+    return unquote(name).lower().replace("-", "_")
 
 
 def secret_params(text: str) -> list[str]:
-    """Names (never values) of credential-like parameters anywhere in `text`."""
-    return sorted({unquote(m.group(2)) for m in URI_PARAM_RE.finditer(text) if is_secret_param(m.group(2))})
+    """Canonical names (from SECRET_URI_PARAMS — never the user's bytes, never values) of
+    credential-like parameters anywhere in `text`."""
+    return sorted({canonical_param(m.group(2)) for m in URI_PARAM_RE.finditer(text)}
+                  & SECRET_URI_PARAMS)
 
 
 def credential_errors(where: str, value: str) -> list[str]:
-    errs = []
     names = secret_params(value)
-    if names:
-        errs.append(f"{where}: credential parameter(s) {', '.join(names)} are not allowed; "
-                    "reference secrets by env-var name via a *_env key")
-    return errs
+    return [f"{where}: " + MSG_CRED_PARAMS.format(names=", ".join(names))] if names else []
 
 
 def check_value(where: str, kind: str, value, errors: list[str]):
@@ -316,22 +326,21 @@ def check_value(where: str, kind: str, value, errors: list[str]):
     elif kind in ("http_url", "sc_uri", "s3_uri"):
         schemes = {"http_url": ("http", "https"), "sc_uri": ("sc",), "s3_uri": ("s3", "s3a")}[kind]
         errs = credential_errors(where, value)
-        scheme = value.split("://", 1)[0] if "://" in value else ""
         try:
             u = urlparse(value)
-            u.port  # raises ValueError on a non-numeric/out-of-range port
-            ok = u.scheme in schemes and bool(u.hostname)
+            port = u.port  # raises ValueError on a non-numeric/out-of-range port
+            ok = (u.scheme in schemes and bool(u.hostname)
+                  and (port is None or 1 <= port <= 65535))
             userinfo = "@" in u.netloc
         except ValueError:  # e.g. unbalanced IPv6 brackets, non-numeric port
             ok, userinfo = False, "@" in value.split("//", 1)[-1].split("/", 1)[0]
+        # URI and host:port errors never contain any part of the value (not even the
+        # scheme): a malformed one may hold a secret anywhere, e.g. `http://user:pass`.
         if not ok:
-            # URI and host:port values are never echoed in errors: a malformed one may hold
-            # a secret where the port should be (e.g. `http://user:pass`).
-            errs.append(f"{where}: must be a {' or '.join(s + '://' for s in schemes)} URI with a "
-                        f"host and an optional numeric port (got scheme {scheme[:10]!r}; value not shown)")
+            errs.append(f"{where}: " + MSG_BAD_URI.format(
+                schemes=" or ".join(sc + "://" for sc in schemes)))
         if userinfo:
-            errs.append(f"{where}: credentials in URI userinfo (user:password@) are not allowed; "
-                        "reference them by env-var name via a *_env key")
+            errs.append(f"{where}: " + MSG_USERINFO)
         if errs:
             errors.extend(errs)
             return None  # never hand an invalid URI to hosts_of() or the output
@@ -341,16 +350,12 @@ def check_value(where: str, kind: str, value, errors: list[str]):
         for n, p in enumerate(parts, start=1):
             host, _, port = p.rpartition(":")
             if "@" in p:
-                errs.append(f"{where}: entry {n}: credentials (user@) are not allowed in host:port")
+                errs.append(f"{where}: " + MSG_HP_USERINFO.format(n=n))
             elif HOSTPORT_FORBIDDEN & set(p):
-                # Never echo: anything after ?/;/&/# may be a secret even if its name isn't listed.
-                errs.append(f"{where}: entry {n}: must be plain host:port "
-                            f"(no {' '.join(sorted(HOSTPORT_FORBIDDEN - {'@'}))} characters)")
-            elif not host:
-                errs.append(f"{where}: entry {n}: must be host:port (missing host)")
-            elif not port.isdigit() or not 0 < int(port) <= 65535:
-                # Show the host only; a bad "port" may be a password typed as user:pass.
-                errs.append(f"{where}: entry {n} (host {host!r}): port must be a number 1-65535")
+                errs.append(f"{where}: " + MSG_HP_FORBIDDEN.format(n=n))
+            elif not HOSTPORT_HOST_RE.match(host) or not port.isdigit() \
+                    or not 1 <= int(port) <= 65535:
+                errs.append(f"{where}: " + MSG_BAD_HOSTPORT.format(n=n))
         if errs:
             errors.extend(errs)
             return None
@@ -669,16 +674,23 @@ def self_test() -> int:
                                           "delta_sharing.endpoint: credential parameter(s) api_key")),
                f"leaked={leaked}\n{err}")
 
-        # (section, key, value, expected stderr fragment). Every value embeds the marker
-        # SECRETVAL, which must never reach stdout or stderr.
+        # (section, key, value, expected stderr fragment). Errors for URI / host:port fields
+        # must consist ONLY of the stable templates, and no token of the supplied value
+        # (outside that fixed vocabulary) may reach stdout or stderr.
         leak_cases = [
             ("kafka", "bootstrap_servers", "k1.internal:9092?token=SECRETVAL", "credential parameter(s) token"),
             ("kafka", "bootstrap_servers", "k1.internal:9092;api_key=SECRETVAL", "credential parameter(s) api_key"),
             ("kafka", "bootstrap_servers", "k1.internal:9092&X-Amz-Signature=SECRETVAL",
-             "credential parameter(s) X-Amz-Signature"),
-            ("kafka", "bootstrap_servers", "k1.internal:9092?opaque=SECRETVAL", "must be plain host:port"),
-            ("kafka", "bootstrap_servers", "k1.internal:SECRETVAL?x=1", "must be plain host:port"),
+             "credential parameter(s) x_amz_signature"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092?opaque=SECRETVAL", "invalid host:port"),
+            ("kafka", "bootstrap_servers", "k1.internal:SECRETVAL?x=1", "invalid host:port"),
             ("kafka", "bootstrap_servers", "k1.internal:9092,SECRETVAL@k2:9092", "entry 2: credentials"),
+            ("kafka", "bootstrap_servers", "k1.internal:SECRETVAL", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", ":SECRETVAL", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "SECRETVAL:notaport", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "user:SECRETVAL:notaport", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092,user:SECRETVAL:9092", "entry 2: invalid host:port"),
+            ("kafka", "bootstrap_servers", "k1.internal:0", "entry 1: invalid host:port"),
             ("object_store", "s3_endpoint", "https://s3.internal/?aws_access_key_id=SECRETVAL",
              "credential parameter(s) aws_access_key_id"),
             ("object_store", "s3_endpoint", "https://s3.internal/?secret_key=SECRETVAL",
@@ -687,22 +699,49 @@ def self_test() -> int:
             ("mlflow", "tracking_uri", "https://mlflow.internal/#access_token=SECRETVAL",
              "credential parameter(s) access_token"),
             ("mlflow", "tracking_uri", "http://SECRETVAL@[::1", "credentials in URI userinfo"),
-            ("mlflow", "tracking_uri", "http://[::1", "URI with a host"),
-            ("mlflow", "tracking_uri", "http://:8080", "URI with a host"),
-            ("mlflow", "tracking_uri", "http://mlflow.internal:SECRETVAL", "URI with a host"),
-            ("kafka", "bootstrap_servers", "k1.internal:SECRETVAL", "port must be a number"),
-            ("kafka", "bootstrap_servers", ":SECRETVAL", "missing host"),
+            ("mlflow", "tracking_uri", "http://[::1", "invalid URI"),
+            ("mlflow", "tracking_uri", "http://:8080", "invalid URI"),
+            ("mlflow", "tracking_uri", "http://mlflow.internal:SECRETVAL", "invalid URI"),
+            ("mlflow", "tracking_uri", "SECRETVAL://mlflow.internal", "invalid URI"),
+            ("mlflow", "tracking_uri", "http://mlflow.internal:0", "invalid URI"),
             ("spark", "connect_uri", "sc://[spark.internal:15002/;token=SECRETVAL", "credential parameter(s) token"),
+            ("spark", "connect_uri", "sc://spark.internal:0", "invalid URI"),
         ]
+        names_rx = "(?:" + "|".join(sorted(SECRET_URI_PARAMS)) + ")"
+        schemes_rx = "(?:http:// or https://|sc://|s3:// or s3a://)"
+
+        def template_rx(tmpl: str) -> str:
+            rx = re.escape(tmpl)
+            for ph, sub in (("{names}", f"{names_rx}(?:, {names_rx})*"), ("{schemes}", schemes_rx),
+                            ("{n}", r"\d+")):
+                rx = rx.replace(re.escape(ph), sub)
+            return rx
+
+        templates = [template_rx(t) for t in (MSG_CRED_PARAMS, MSG_USERINFO, MSG_BAD_URI,
+                                              MSG_HP_USERINFO, MSG_HP_FORBIDDEN, MSG_BAD_HOSTPORT)]
+        vocab = set(re.findall(r"[a-z0-9]+", " ".join(
+            [MSG_CRED_PARAMS, MSG_USERINFO, MSG_BAD_URI, MSG_HP_USERINFO, MSG_HP_FORBIDDEN,
+             MSG_BAD_HOSTPORT, "http https sc s3 s3a", " ".join(SECRET_URI_PARAMS),
+             " ".join(f"{sec} {k}" for sec in SCHEMA for k in SCHEMA[sec])]).lower().replace("_", " ")))
         bad_syntax = []
         for section, key, value, fragment in leak_cases:
             extra = {"object_store": 'kind = "s3"\nbucket = "b"\nwarehouse = "s3://b/w"\n'}.get(section, "")
             body = f'[profile]\nname = "leak"\ninvocation = "local"\n[{section}]\n{key} = "{value}"\n{extra}'
-            code, out, err = _call(["--file", write("leak.profile.toml", body)], {}, aux)
-            if code != 1 or "SECRETVAL" in out + err or fragment not in err or "Traceback" in err:
-                bad_syntax.append(f"{value!r}: code={code} out={out!r} err={err!r}")
-        expect(f"{len(leak_cases)} credential / malformed-URI syntaxes rejected (exit 1, no traceback), "
-               "secret absent from stdout+stderr", not bad_syntax, "\n".join(bad_syntax))
+            path = write("leak.profile.toml", body)
+            code, out, err = _call(["--file", path], {}, aux)
+            field = re.escape(f"{section}.{key}")
+            lines = err.splitlines()
+            unstable = [ln for ln in lines[1:]
+                        if not any(re.fullmatch(rf"  - {field}: {t}", ln) for t in templates)]
+            tokens = [t for t in re.findall(r"[A-Za-z0-9]{3,}", value) if t.lower() not in vocab]
+            leaked = [t for t in tokens if t in out + err.replace(path, "")]
+            if (code != 1 or out or "Traceback" in err or fragment not in err or unstable or leaked
+                    or lines[:1] != [f"load_profile: invalid profile ({path}):"]):
+                bad_syntax.append(f"{value!r}: code={code} unstable={unstable} leaked={leaked} "
+                                  f"out={out!r} err={err!r}")
+        expect(f"{len(leak_cases)} credential / malformed URI & host:port values rejected: exit 1, "
+               "no traceback, only stable messages, no value token in stdout/stderr",
+               not bad_syntax, "\n".join(bad_syntax))
 
         code, out, err = _call(["--file", aux], {}, aux)
         expect("unsupported path (directory without extension) -> exit 2", code == 2, err)
