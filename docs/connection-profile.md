@@ -179,14 +179,19 @@ rejected, as are credentials embedded in any URI or `host:port` field — userin
 (`https://user:pass@host`, `user@host:port`) or credential parameters such as
 `?token=`, `?api_key=`, `X-Amz-Signature=`, `aws_access_key_id=`, or Spark Connect's
 `;token=` (names are percent-decoded before matching). `host:port` fields additionally
-reject `? ; & # /` outright and require a plain hostname / IPv4 / bracketed IPv6 host, so
-`user:pass:9092` is rejected rather than accepted as host `user:pass`. Ports must be
-1–65535 (port `0` is rejected) in both URI and `host:port` fields.
+reject `? ; & # /` outright. Hosts — in `host:port` entries and URIs — must be a DNS name
+or IPv4 address validated label by label (so `a..b` and `user:pass` fail), or a bracketed
+literal that parses as a real IPv6 address (`[::1]` passes, `[deadbeef]` fails). Ports
+must be 1–65535 (port `0` is rejected).
 
-Errors for URI and `host:port` fields use fixed messages containing only the field name,
-the entry number, and **canonical** parameter names from the loader's own list (e.g.
-`x_amz_signature`, never the user's spelling). No part of the supplied value — not the
-scheme, host, port, or parameter values — is ever echoed. The loader reports each referenced variable as `set` / `unset` in
+**No message ever echoes a profile value.** Every error and warning the loader emits —
+for any field, and for file-level problems (TOML syntax, malformed `.env` lines, invalid
+UTF-8) — is a fixed text containing only: the file path, the field name, an entry number,
+a byte/line/column position, and canonical parameter names from the loader's own list
+(e.g. `x_amz_signature`, never the user's spelling). Section, key, variable, and profile
+names are shown only when they are plain identifiers (`[A-Za-z0-9_.-]{1,64}`), otherwise
+as `<name not shown>`. Values only ever appear in the normal output of a profile that
+passed validation. The loader reports each referenced variable as `set` / `unset` in
 `_meta.secrets` and never prints a value.
 
 ## Invocation modes

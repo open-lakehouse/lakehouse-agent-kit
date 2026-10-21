@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import glob
 import io
+import ipaddress
 import json
 import os
 import re
@@ -83,11 +84,13 @@ SECRET_URI_PARAMS = {
 URI_PARAM_RE = re.compile(r"([;?&#])([A-Za-z0-9_.%-]+)=([^;&#]*)")
 # Characters that never belong in a host:port entry (they start params / userinfo).
 HOSTPORT_FORBIDDEN = set("@?;&#/")
-# A host:port host: DNS name / IPv4 (underscores allowed for *_HOST placeholders) or a
-# bracketed IPv6 literal. Anything else — notably an extra `:` as in `user:pass:9092` —
-# is rejected so it can never reach the output.
-HOSTPORT_HOST_RE = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)$")
-# Stable error texts for URI / host:port fields. They contain no part of the supplied
+# One DNS label (underscores allowed for *_HOST placeholders); hosts are validated per
+# label so empty labels (`a..b`) fail. Bracketed hosts must be real IPv6 literals.
+DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+# Names (sections, keys, variable names, profile names) are shown in messages only when
+# they look like plain identifiers; profile VALUES are never shown.
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# Stable message texts for value-bearing fields. They contain no part of the supplied
 # value: only the field name, an entry number, and canonical names from SECRET_URI_PARAMS.
 MSG_CRED_PARAMS = "credential parameter(s) {names} are not allowed; reference secrets by env-var name via a *_env key"
 MSG_USERINFO = "credentials in URI userinfo (user:password@) are not allowed; reference them by env-var name via a *_env key"
@@ -95,6 +98,37 @@ MSG_BAD_URI = "invalid URI (expected {schemes} with a host and an optional port 
 MSG_HP_USERINFO = "entry {n}: credentials (user@) are not allowed in host:port"
 MSG_HP_FORBIDDEN = "entry {n}: invalid host:port (characters ? ; & # / are not allowed; value not shown)"
 MSG_BAD_HOSTPORT = "entry {n}: invalid host:port (expected host:port with port 1-65535; value not shown)"
+MSG_PLACEHOLDER_URI = "unfilled template placeholder host is not allowed; value not shown"
+MSG_PLACEHOLDER_HP = "entry {n}: unfilled template placeholder host is not allowed; value not shown"
+MSG_BAD_ENUM = "must be one of {choices}; value not shown"
+MSG_BAD_BOOL = "expected a boolean (true/false); value not shown"
+MSG_BAD_NAME = "must match [A-Za-z0-9][A-Za-z0-9._-]*; value not shown"
+
+
+def shown(name) -> str:
+    """A name as it may appear in a message, or a fixed stand-in if it isn't a plain
+    identifier (so pasted secrets or control characters never reach the terminal)."""
+    return name if isinstance(name, str) and SAFE_NAME_RE.match(name) else "<name not shown>"
+
+
+def valid_host(host: str) -> bool:
+    if host.startswith("[") or host.endswith("]"):
+        if not (host.startswith("[") and host.endswith("]")):
+            return False
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+            return True
+        except ValueError:
+            return False
+    return 0 < len(host) <= 253 and all(DNS_LABEL_RE.match(label) for label in host.split("."))
+
+
+def netloc_host(netloc: str) -> str:
+    """Host part of a URI netloc, case and IPv6 brackets preserved."""
+    hostport = netloc.rsplit("@", 1)[-1]
+    if hostport.startswith("[") and "]" in hostport:
+        return hostport[: hostport.index("]") + 1]
+    return hostport.split(":", 1)[0]
 
 
 class ProfileError(Exception):
@@ -114,7 +148,10 @@ def read_toml(path: str) -> dict:
         try:
             return tomllib.load(fh)
         except tomllib.TOMLDecodeError as exc:
-            raise ProfileError(f"{path}: invalid TOML: {exc}") from None
+            # Keep only the position; the decoder text can quote file content.
+            pos = re.search(r"\(at line \d+, column \d+\)|\(at end of document\)", str(exc))
+            at = f" {pos.group(0)}" if pos else ""
+            raise ProfileError(f"{path}: invalid TOML syntax{at}; content not shown") from None
 
 
 def split_env_name(name: str):
@@ -137,7 +174,7 @@ def parse_env_lines(text: str, path: str) -> dict[str, str]:
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
         if "=" not in line:
-            raise ProfileError(f"{path}:{n}: expected KEY=VALUE, got {raw.strip()!r}")
+            raise ProfileError(f"{path}:{n}: expected KEY=VALUE; line not shown")
         key, value = line.split("=", 1)
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -154,14 +191,14 @@ def env_to_sections(env: dict[str, str], warnings: list[str], strict_origin: str
         parsed = split_env_name(name)
         if parsed is None:
             if strict_origin:
-                warnings.append(f"{strict_origin}: ignoring unrecognized variable {name}")
+                warnings.append(f"{strict_origin}: ignoring unrecognized variable {shown(name)}")
             continue
         section, key = parsed
         # Inline-secret keys are kept from files (so validate() rejects them) but not from
         # the process env, where holding a secret is legitimate.
         if key not in SCHEMA[section] and not (strict_origin and key in INLINE_SECRET_KEYS):
             if strict_origin:
-                warnings.append(f"{strict_origin}: ignoring unknown key {name}")
+                warnings.append(f"{strict_origin}: ignoring unknown key {shown(name)}")
             continue
         data.setdefault(section, {})[key] = value
     return data
@@ -181,7 +218,9 @@ def read_profile_file(path: str, warnings: list[str]) -> dict:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
     except UnicodeError as exc:
-        raise ProfileError(f"{path}: not valid UTF-8 ({exc})") from None
+        offset = getattr(exc, "start", None)
+        at = f" at byte offset {offset}" if isinstance(offset, int) else ""
+        raise ProfileError(f"{path}: not valid UTF-8{at}; content not shown") from None
     except OSError as exc:
         raise ProfileError(f"{path}: cannot read profile file: {exc.strerror or exc}") from None
     return env_to_sections(parse_env_lines(text, path), warnings, strict_origin=path)
@@ -208,7 +247,7 @@ def discover(environ: dict, cwd: str, home: str) -> list[tuple[str, str]]:
                 seen.add(real)
                 try:
                     name = read_profile_file(path, []).get("profile", {}).get("name", "")
-                    found.append((path, str(name) or "<no [profile].name>"))
+                    found.append((path, shown(name) if name else "<no [profile].name>"))
                 except ProfileError as exc:
                     found.append((path, f"<unreadable: {exc}>"))
     return found
@@ -242,9 +281,9 @@ def select(args, environ: dict, cwd: str, home: str):
             return matches[0], by
         dirs = search_dirs(environ, cwd, home)
         if not matches:
-            raise ProfileError(f"no profile named '{name}' ({by}). Candidates:\n"
+            raise ProfileError(f"no profile named '{shown(name)}' ({by}). Candidates:\n"
                                + candidates_text(cands, dirs))
-        raise ProfileError(f"profile name '{name}' is ambiguous; choose one with --file:\n"
+        raise ProfileError(f"profile name '{shown(name)}' is ambiguous; choose one with --file:\n"
                            + "\n".join(f"  - {p}" for p in matches))
     if environ.get("LAKEHOUSE_PROFILE_NAME"):
         return None, "env (LAKEHOUSE_PROFILE_NAME)"
@@ -262,12 +301,9 @@ def hosts_of(kind: str, value: str) -> list[str]:
         return [hp.rsplit(":", 1)[0].strip("[]") for hp in value.split(",")]
     # urlparse().hostname lower-cases; keep case so *_HOST placeholders are detectable.
     try:
-        netloc = urlparse(value).netloc.rsplit("@", 1)[-1]
+        return [netloc_host(urlparse(value).netloc)]
     except ValueError:
         return []
-    if netloc.startswith("[") and "]" in netloc:  # IPv6 literal
-        return [netloc[1:netloc.index("]")]]
-    return [netloc.split(":", 1)[0]]
 
 
 def canonical_param(name: str) -> str:
@@ -296,7 +332,7 @@ def check_value(where: str, kind: str, value, errors: list[str]):
             return True
         if low in ("false", "0", "no"):
             return False
-        errors.append(f"{where}: expected a boolean, got {value!r}")
+        errors.append(f"{where}: " + MSG_BAD_BOOL)
         return None
     if kind == "str_list":
         items = value if isinstance(value, list) else str(value).split(",")
@@ -311,14 +347,14 @@ def check_value(where: str, kind: str, value, errors: list[str]):
     if kind == "invocation":
         value = value.lower()
         if value not in INVOCATIONS:
-            errors.append(f"{where}: must be one of {'|'.join(INVOCATIONS)}, got {value!r}")
+            errors.append(f"{where}: " + MSG_BAD_ENUM.format(choices="|".join(INVOCATIONS)))
     elif kind == "store_kind":
         value = value.lower()
         if value not in STORE_KINDS:
-            errors.append(f"{where}: must be one of {'|'.join(STORE_KINDS)}, got {value!r}")
+            errors.append(f"{where}: " + MSG_BAD_ENUM.format(choices="|".join(STORE_KINDS)))
     elif kind == "name":
         if not NAME_RE.match(value):
-            errors.append(f"{where}: {value!r} must match {NAME_RE.pattern}")
+            errors.append(f"{where}: " + MSG_BAD_NAME)
     elif kind == "env_name":
         if not ENV_NAME_RE.match(value):
             errors.append(f"{where}: must be an env var NAME (e.g. LAKEHOUSE_UC_TOKEN), "
@@ -329,7 +365,7 @@ def check_value(where: str, kind: str, value, errors: list[str]):
         try:
             u = urlparse(value)
             port = u.port  # raises ValueError on a non-numeric/out-of-range port
-            ok = (u.scheme in schemes and bool(u.hostname)
+            ok = (u.scheme in schemes and bool(u.hostname) and valid_host(netloc_host(u.netloc))
                   and (port is None or 1 <= port <= 65535))
             userinfo = "@" in u.netloc
         except ValueError:  # e.g. unbalanced IPv6 brackets, non-numeric port
@@ -353,7 +389,7 @@ def check_value(where: str, kind: str, value, errors: list[str]):
                 errs.append(f"{where}: " + MSG_HP_USERINFO.format(n=n))
             elif HOSTPORT_FORBIDDEN & set(p):
                 errs.append(f"{where}: " + MSG_HP_FORBIDDEN.format(n=n))
-            elif not HOSTPORT_HOST_RE.match(host) or not port.isdigit() \
+            elif not valid_host(host) or not port.isdigit() \
                     or not 1 <= int(port) <= 65535:
                 errs.append(f"{where}: " + MSG_BAD_HOSTPORT.format(n=n))
         if errs:
@@ -376,7 +412,7 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
     out: dict = {}
     for section, body in raw.items():
         if section not in SCHEMA:
-            warnings.append(f"ignoring unknown section [{section}]")
+            warnings.append(f"ignoring unknown section [{shown(section)}]")
             continue
         if not isinstance(body, dict):
             errors.append(f"[{section}] must be a table")
@@ -386,7 +422,7 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
                 errors.append(f"{section}.{key}: inline secrets are not allowed; set "
                               f"{section}.{key}_env to the NAME of an env var instead")
             elif key not in SCHEMA[section]:
-                warnings.append(f"ignoring unknown key {section}.{key}")
+                warnings.append(f"ignoring unknown key {section}.{shown(key)}")
         # Blank (empty/whitespace-only) strings and lists mean unset; a section with
         # nothing set is treated as absent.
         present = {k: v for k, v in body.items() if k in SCHEMA[section] and not is_blank(v)}
@@ -404,9 +440,10 @@ def validate(raw: dict, require: list[str], allow_placeholders: bool,
             if required and norm[key] in ("", []):
                 errors.append(f"{section}.{key}: required value is empty")
             if kind in ("http_url", "sc_uri", "hostports") and isinstance(norm[key], str):
-                for host in hosts_of(kind, norm[key]):
+                for n, host in enumerate(hosts_of(kind, norm[key]), start=1):
                     if PLACEHOLDER_HOST_RE.match(host):
-                        msg = f"{section}.{key}: host {host!r} is an unfilled template placeholder"
+                        msg = f"{section}.{key}: " + (MSG_PLACEHOLDER_HP.format(n=n)
+                                                      if kind == "hostports" else MSG_PLACEHOLDER_URI)
                         (warnings if allow_placeholders else errors).append(msg)
         out[section] = norm
 
@@ -482,7 +519,7 @@ def run(argv: list[str], environ: dict, cwd: str, home: str) -> int:
     require = [s.strip() for s in args.require.split(",") if s.strip()]
     unknown = [s for s in require if s not in SCHEMA]
     if unknown:
-        print(f"load_profile: --require: unknown section(s) {', '.join(unknown)} "
+        print(f"load_profile: --require: unknown section(s) {', '.join(shown(u) for u in unknown)} "
               f"(known: {', '.join(SCHEMA)})", file=sys.stderr)
         return 2
 
@@ -706,6 +743,17 @@ def self_test() -> int:
             ("mlflow", "tracking_uri", "http://mlflow.internal:0", "invalid URI"),
             ("spark", "connect_uri", "sc://[spark.internal:15002/;token=SECRETVAL", "credential parameter(s) token"),
             ("spark", "connect_uri", "sc://spark.internal:0", "invalid URI"),
+            ("mlflow", "tracking_uri", "http://SECRETVAL_HOST:8080", "unfilled template placeholder"),
+            ("kafka", "bootstrap_servers", "SECRETVAL_HOST:9092", "entry 1: unfilled template placeholder"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092,SECRETVAL_HOST:9092",
+             "entry 2: unfilled template placeholder"),
+            ("kafka", "bootstrap_servers", "[deadbeef]:9092", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "[....]:9092", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "[SECRETVAL]:9092", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "SECRETVAL..internal:9092", "entry 1: invalid host:port"),
+            ("kafka", "bootstrap_servers", "a..b:9092", "entry 1: invalid host:port"),
+            ("mlflow", "tracking_uri", "http://SECRETVAL..internal/", "invalid URI"),
+            ("mlflow", "tracking_uri", "http://[SECRETVAL]:5000/", "invalid URI"),
         ]
         names_rx = "(?:" + "|".join(sorted(SECRET_URI_PARAMS)) + ")"
         schemes_rx = "(?:http:// or https://|sc://|s3:// or s3a://)"
@@ -717,11 +765,11 @@ def self_test() -> int:
                 rx = rx.replace(re.escape(ph), sub)
             return rx
 
-        templates = [template_rx(t) for t in (MSG_CRED_PARAMS, MSG_USERINFO, MSG_BAD_URI,
-                                              MSG_HP_USERINFO, MSG_HP_FORBIDDEN, MSG_BAD_HOSTPORT)]
+        value_msgs = (MSG_CRED_PARAMS, MSG_USERINFO, MSG_BAD_URI, MSG_HP_USERINFO, MSG_HP_FORBIDDEN,
+                      MSG_BAD_HOSTPORT, MSG_PLACEHOLDER_URI, MSG_PLACEHOLDER_HP)
+        templates = [template_rx(t) for t in value_msgs]
         vocab = set(re.findall(r"[a-z0-9]+", " ".join(
-            [MSG_CRED_PARAMS, MSG_USERINFO, MSG_BAD_URI, MSG_HP_USERINFO, MSG_HP_FORBIDDEN,
-             MSG_BAD_HOSTPORT, "http https sc s3 s3a", " ".join(SECRET_URI_PARAMS),
+            [*value_msgs, "http https sc s3 s3a", " ".join(SECRET_URI_PARAMS),
              " ".join(f"{sec} {k}" for sec in SCHEMA for k in SCHEMA[sec])]).lower().replace("_", " ")))
         bad_syntax = []
         for section, key, value, fragment in leak_cases:
@@ -739,9 +787,71 @@ def self_test() -> int:
                     or lines[:1] != [f"load_profile: invalid profile ({path}):"]):
                 bad_syntax.append(f"{value!r}: code={code} unstable={unstable} leaked={leaked} "
                                   f"out={out!r} err={err!r}")
-        expect(f"{len(leak_cases)} credential / malformed URI & host:port values rejected: exit 1, "
-               "no traceback, only stable messages, no value token in stdout/stderr",
+        expect(f"{len(leak_cases)} credential / malformed / placeholder URI & host:port values rejected: "
+               "exit 1, no traceback, only stable messages, no value token in stdout/stderr",
                not bad_syntax, "\n".join(bad_syntax))
+
+        # Guard against overcorrection: valid hosts (incl. bracketed IPv6) must still load.
+        must_pass = [
+            ("kafka", "bootstrap_servers", "[::1]:9092"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092, [2001:db8::1]:9093, 10.0.0.7:9094"),
+            ("kafka", "bootstrap_servers", "kafka_broker-1.svc.cluster.local:9092"),
+            ("mlflow", "tracking_uri", "http://[::1]:5000"),
+            ("mlflow", "tracking_uri", "https://mlflow.internal:65535/api"),
+        ]
+        rejected = []
+        for section, key, value in must_pass:
+            body = f'[profile]\nname = "ok"\ninvocation = "local"\n[{section}]\n{key} = "{value}"\n'
+            code, out, err = _call(["--file", write("ok.profile.toml", body)], {}, aux)
+            if code != 0:
+                rejected.append(f"{value!r}: code={code} err={err!r}")
+        expect(f"{len(must_pass)} valid hosts accepted (bracketed IPv6, IPv4, DNS names)", not rejected,
+               "\n".join(rejected))
+
+        # Every other message site: a profile value (marker SECRETVAL) must never reach
+        # stdout/stderr, whatever the failure — non-URI fields, file-level errors, names.
+        site_cases = [
+            ("bool field", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
+             '[object_store]\nkind = "s3"\ns3_endpoint = "https://s3.internal"\nbucket = "b"\n'
+             'warehouse = "s3://b/w"\npath_style = "SECRETVAL"\n', 1, MSG_BAD_BOOL),
+            ("invocation enum", "toml", '[profile]\nname = "x"\ninvocation = "SECRETVAL"\n', 1, "must be one of"),
+            ("store kind enum", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
+             '[object_store]\nkind = "SECRETVAL"\ns3_endpoint = "https://s3.internal"\nbucket = "b"\n'
+             'warehouse = "s3://b/w"\n', 1, "must be one of"),
+            ("profile name", "toml", '[profile]\nname = "SECRETVAL with spaces"\ninvocation = "local"\n', 1,
+             MSG_BAD_NAME),
+            ("env-name field", "toml", '[profile]\nname = "x"\ninvocation = "local"\n[unity_catalog]\n'
+             'rest_url = "https://uc.internal"\ntoken_env = "SECRETVAL-raw-token"\n', 1, "env var NAME"),
+            ("inline secret key", "toml", '[profile]\nname = "x"\ninvocation = "local"\n[unity_catalog]\n'
+             'rest_url = "https://uc.internal"\ntoken = "SECRETVAL"\n', 1, "inline secrets"),
+            ("TOML syntax", "toml", '[profile]\nname = "x\ninvocation = SECRETVAL\n', 2, "invalid TOML syntax"),
+            ("TOML bad value", "toml", '[profile]\nname = SECRETVAL\n', 2, "invalid TOML syntax"),
+            (".env missing '='", "env", "LAKEHOUSE_PROFILE_NAME=x\nLAKEHOUSE_UC_TOKEN SECRETVAL\n", 2,
+             "expected KEY=VALUE; line not shown"),
+            (".env bad UTF-8", "env", b"SECRETVAL\xff=1\nLAKEHOUSE_PROFILE_NAME=SECRETVAL\n", 2, "content not shown"),
+            ("TOML bad UTF-8", "toml", b'[profile]\nname = "SECRETVAL\xfe"\n', 2, "content not shown"),
+            (".env odd variable name", "env", "LAKEHOUSE_PROFILE_NAME=x\nLAKEHOUSE_PROFILE_INVOCATION=local\n"
+             "SECRETVAL key=1\n", 0, "<name not shown>"),
+            ("unknown section/key names", "toml", '[profile]\nname = "x"\ninvocation = "local"\n'
+             '["SECRETVAL section"]\nk = 1\n[spark]\nconnect_uri = "sc://s.internal"\n"SECRETVAL key" = 1\n',
+             0, "<name not shown>"),
+        ]
+        site_bad = []
+        for label, ext, body, want_code, fragment in site_cases:
+            path = write(f"site.profile.{ext}", body)
+            code, out, err = _call(["--file", path], {}, aux)
+            if code != want_code or "SECRETVAL" in out + err or fragment not in err or "Traceback" in err:
+                site_bad.append(f"{label}: code={code} out={out!r} err={err!r}")
+        # Candidate listing shows discovered [profile].name values — sanitized.
+        cand = os.path.join(aux, "cand")
+        os.mkdir(cand)
+        with open(os.path.join(cand, "c.profile.toml"), "w", encoding="utf-8") as fh:
+            fh.write('[profile]\nname = "SECRETVAL pasted here"\ninvocation = "local"\n')
+        code, out, err = _call([], {"LAKEHOUSE_PROFILE_DIR": cand}, cand)
+        if code != 2 or "SECRETVAL" in out + err or "<name not shown>" not in err:
+            site_bad.append(f"candidate listing: code={code} err={err!r}")
+        expect(f"{len(site_cases) + 1} other message sites (non-URI fields, file errors, names) never "
+               "echo a value", not site_bad, "\n".join(site_bad))
 
         code, out, err = _call(["--file", aux], {}, aux)
         expect("unsupported path (directory without extension) -> exit 2", code == 2, err)
