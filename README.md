@@ -1,4 +1,4 @@
-# Lakehouse Agent Toolkit
+# Lakehouse Agent Kit
 
 Cross-agent **Agent Skills** for building on an open-source lakehouse stack —
 Apache Spark, Delta Lake, Apache Iceberg, Unity Catalog (OSS), Kafka, Airflow,
@@ -31,11 +31,11 @@ plugin marketplace, a `pip`/`uvx` installer, and plain copy-in.
 
 ```bash
 # Claude Code / Cursor / Codex — plugin marketplace
-claude plugin marketplace add <org>/lakehouse-agent-toolkit
+claude plugin marketplace add <org>/lakehouse-agent-kit
 claude plugin install lakehouse-tools@lakehouse-marketplace
 
 # Any skills-aware agent — cross-agent installer
-uvx lakehouse-agent-toolkit install        # auto-detects agents, writes skills into each
+uvx lakehouse-agent-kit install        # auto-detects agents, writes skills into each
 
 # Lowest common denominator — copy the skills dir in
 cp -r skills ~/.claude/skills/

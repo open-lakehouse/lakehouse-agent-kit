@@ -1,7 +1,7 @@
-# Lakehouse Agent Toolkit — Implementation Plan (v1)
+# Lakehouse Agent Kit — Implementation Plan (v1)
 
 > Status: **Draft for review** (Lisa, Andre, Tony). Date: 2026-10-21.
-> Owner: TBD. Target: a cross-agent **Lakehouse Agent Toolkit** — the
+> Owner: TBD. Target: a cross-agent **Lakehouse Agent Kit** — the
 > open-source analogue of the Databricks agent toolkit (`databricks/databricks-agent-skills`).
 
 ---
@@ -23,7 +23,7 @@ the stack, and distribute it the way the Databricks toolkit is distributed.
 
 ## 2. What we're building
 
-A repo (`lakehouse-agent-toolkit`) that ships:
+A repo (`lakehouse-agent-kit`) that ships:
 
 1. **A set of spec-portable Agent Skills** organized as a parent/entry skill
    (`lakehouse-core`) + product skills, each driving the native engine CLIs via
@@ -66,7 +66,7 @@ servers; bundling/operating the compute stack itself.
 ## 4. Proposed repo layout
 
 ```
-lakehouse-agent-toolkit/
+lakehouse-agent-kit/
 ├── README.md                     # product framing + quickstart
 ├── IMPLEMENTATION_PLAN.md        # this file
 ├── CONTRIBUTING.md               # skill-authoring contract (frontmatter, size, lint)
@@ -203,7 +203,7 @@ Each must be re-verified against a running stack before the skill ships.
 4. **MCP** — reuse community servers, or invest in a first-party one for UC/Iceberg?
 5. **Relationship to `open-lakehouse`** — is it the upstream source of truth for skill
    content (sync direction), or do skills fork and diverge?
-6. **Repo home / org, naming** (`lakehouse-agent-toolkit`?), **license** (Apache-2.0?),
+6. **Repo home / org, naming** (`lakehouse-agent-kit`?), **license** (Apache-2.0?),
    and **maintainership**.
 
 ## 11. Risks
