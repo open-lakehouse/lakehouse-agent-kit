@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Lint every skills/*/SKILL.md against the skill-authoring contract (CONTRIBUTING.md).
+
+Stdlib-only; run as `python3 -I scripts/lint_skills.py`. Checks:
+
+  frontmatter   only the six spec-portable fields (name, description, license,
+                compatibility, metadata, allowed-tools); flags Claude-Code-only keys
+  name          present, kebab-case, equals the directory name
+  description   present, <= 1536 chars (skill-listing truncation limit)
+  compatibility <= 500 chars when present
+  metadata      a mapping; `parent`, when set, names an existing skill
+  size          body <= 500 lines
+  portability   no hardcoded `localhost:`, `127.0.0.1`, `sc://localhost`, literal
+                `docker exec <container-name>`, or bare `:PORT` literals
+  links         every [[skill-link]] resolves to an existing skills/<dir>/SKILL.md
+
+Directories whose name starts with `_` (e.g. `_template`) are copy-me templates: every
+rule applies except name == directory. A line containing `lint-allow: portability`
+(e.g. in an HTML comment) is exempt from the portability rules — use sparingly, for
+documented anti-pattern examples only.
+
+Exit status: 0 clean, 1 violations found, 2 usage error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import tempfile
+
+PORTABLE_KEYS = ("name", "description", "license", "compatibility", "metadata", "allowed-tools")
+# Known harness-specific keys, named in messages so authors know where they belong.
+CLAUDE_ONLY_KEYS = {
+    "when_to_use", "hooks", "model", "argument-hint", "disable-model-invocation",
+    "user-invocable", "context", "agent", "paths", "shell", "effort",
+}
+NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+TOP_KEY_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)\s*:(.*)$")
+LINK_RE = re.compile(r"\[\[([^\]\n]+)\]\]")
+
+MAX_DESCRIPTION = 1536
+MAX_COMPATIBILITY = 500
+MAX_NAME = 64
+MAX_BODY_LINES = 500
+ALLOW_MARKER = "lint-allow: portability"
+
+# Portability rules, in priority order. A later match that overlaps an earlier one on
+# the same line is suppressed so one endpoint yields one message.
+HOST_RULES = (
+    ("sc-localhost", re.compile(r"sc://localhost(?::\d+)?", re.I),
+     "hardcoded Spark Connect URI; use the profile's spark.connect_uri"),
+    ("loopback-ip", re.compile(r"(?<![\d.])127\.0\.0\.1(?::\d+)?(?![\d])"),
+     "hardcoded loopback address; reference a lakehouse profile value"),
+    ("localhost", re.compile(r"\blocalhost:\d*", re.I),
+     "hardcoded localhost endpoint; reference a lakehouse profile value"),
+)
+DOCKER_EXEC_RE = re.compile(r"\bdocker\s+(?:container\s+)?exec\b")
+# Options of `docker exec` that consume the following token as their value.
+DOCKER_VALUE_OPTS = {"-u", "--user", "-e", "--env", "-w", "--workdir", "--env-file", "--detach-keys"}
+# `:PORT` = colon + 2-5 digits not preceded by a digit (times, ratios), `[` (slices) or
+# `:`, and not followed by a word char or `.x` (versions). File line refs (`foo.py:12`) are skipped below.
+PORT_RE = re.compile(r"(?<![\d\[:]):(\d{2,5})(?!\w)(?!\.\w)")
+FILE_REF_RE = re.compile(
+    r"\.(?:py|md|sh|toml|env|json|ya?ml|txt|sql|scala|java|kt|ts|js|go|rs|cfg|ini|conf):$")
+
+
+class Linter:
+    def __init__(self, skills_dir: str):
+        self.skills_dir = skills_dir
+        self.violations: list[str] = []
+
+    def report(self, path: str, line: int, rule: str, msg: str) -> None:
+        self.violations.append(f"{path}:{line}: [{rule}] {msg}")
+
+    # -- discovery ---------------------------------------------------------------
+    def skill_dirs(self) -> list[str]:
+        return sorted(
+            d for d in os.listdir(self.skills_dir)
+            if os.path.isdir(os.path.join(self.skills_dir, d)) and not d.startswith(".")
+        )
+
+    def skill_exists(self, slug: str) -> bool:
+        return os.path.isfile(os.path.join(self.skills_dir, slug, "SKILL.md"))
+
+    def run(self) -> int:
+        dirs = self.skill_dirs()
+        for d in dirs:
+            path = os.path.join(self.skills_dir, d, "SKILL.md")
+            if not os.path.isfile(path):
+                self.report(os.path.join(self.skills_dir, d), 0, "missing-skill-md",
+                            "skill directory has no SKILL.md")
+                continue
+            self.lint_file(path, d)
+        return len(dirs)
+
+    # -- per file ----------------------------------------------------------------
+    def lint_file(self, path: str, dirname: str) -> None:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        if not lines or lines[0].strip() != "---":
+            self.report(path, 1, "frontmatter", "file must start with a '---' YAML frontmatter block")
+            return
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if end is None:
+            self.report(path, 1, "frontmatter", "unterminated frontmatter (no closing '---')")
+            return
+        fields = self.parse_frontmatter(path, lines, end)
+        self.check_fields(path, dirname, fields)
+
+        body_lines = len(lines) - end - 1
+        if body_lines > MAX_BODY_LINES:
+            self.report(path, end + 2, "size",
+                        f"body is {body_lines} lines (> {MAX_BODY_LINES}); move depth into references/")
+
+        for idx, text in enumerate(lines, start=1):
+            if ALLOW_MARKER not in text:
+                self.check_portability(path, idx, text)
+            self.check_links(path, idx, text)
+
+    def parse_frontmatter(self, path: str, lines: list[str], end: int) -> dict:
+        """Minimal top-level YAML reader: key -> (line_no, scalar_text, child_lines)."""
+        fields: dict = {}
+        current = None
+        for i in range(1, end):
+            raw = lines[i]
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            if raw[0] in " \t":
+                if current is None:
+                    self.report(path, i + 1, "frontmatter", "indented line before any key")
+                else:
+                    fields[current][2].append(raw.strip())
+                continue
+            m = TOP_KEY_RE.match(raw)
+            if not m:
+                self.report(path, i + 1, "frontmatter", f"unparseable frontmatter line: {raw.strip()!r}")
+                current = None
+                continue
+            key, value = m.group(1), m.group(2).strip()
+            if key in fields:
+                self.report(path, i + 1, "frontmatter", f"duplicate key '{key}'")
+            fields[key] = (i + 1, value, [])
+            current = key
+        return fields
+
+    @staticmethod
+    def scalar(entry) -> str:
+        """Join a scalar value (including folded/literal block continuation lines)."""
+        _, value, children = entry
+        parts = [] if value in ("", ">", "|", ">-", "|-") else [value]
+        text = " ".join(parts + children).strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            text = text[1:-1]
+        return text
+
+    def check_fields(self, path: str, dirname: str, fields: dict) -> None:
+        for key, (line, _, _) in fields.items():
+            if key in PORTABLE_KEYS:
+                continue
+            if key in CLAUDE_ONLY_KEYS:
+                why = "Claude-Code-only extension; it belongs in the generated dist/ bundle, not the skill body"
+            else:
+                why = "not one of the six spec-portable fields"
+            self.report(path, line, "frontmatter-key", f"'{key}' is {why}")
+
+        if "name" not in fields:
+            self.report(path, 1, "name", "missing required 'name'")
+        else:
+            line = fields["name"][0]
+            name = self.scalar(fields["name"])
+            if not NAME_RE.match(name) or len(name) > MAX_NAME:
+                self.report(path, line, "name", f"'{name}' must be kebab-case, <= {MAX_NAME} chars")
+            if not dirname.startswith("_") and name != dirname:
+                self.report(path, line, "name", f"'{name}' does not match directory '{dirname}'")
+
+        if "description" not in fields or not self.scalar(fields["description"]):
+            self.report(path, fields.get("description", (1,))[0], "description",
+                        "missing or empty required 'description'")
+        else:
+            n = len(self.scalar(fields["description"]))
+            if n > MAX_DESCRIPTION:
+                self.report(path, fields["description"][0], "description",
+                            f"description is {n} chars (> {MAX_DESCRIPTION}, truncated in skill listing)")
+
+        if "compatibility" in fields:
+            n = len(self.scalar(fields["compatibility"]))
+            if n > MAX_COMPATIBILITY:
+                self.report(path, fields["compatibility"][0], "compatibility",
+                            f"compatibility is {n} chars (> {MAX_COMPATIBILITY})")
+
+        if "metadata" in fields:
+            line, value, children = fields["metadata"]
+            if value not in ("", "{}"):
+                self.report(path, line, "metadata", "'metadata' must be a mapping")
+            for child in children:
+                m = re.match(r"^parent\s*:\s*(.*)$", child)
+                if m:
+                    parent = m.group(1).strip().strip("\"'")
+                    if not self.skill_exists(parent):
+                        self.report(path, line, "metadata",
+                                    f"metadata.parent '{parent}' is not an existing skill")
+
+    def check_portability(self, path: str, line: int, text: str) -> None:
+        taken: list[tuple[int, int]] = []
+
+        def free(start: int, end: int) -> bool:
+            return all(end <= s or start >= e for s, e in taken)
+
+        for rule, rx, msg in HOST_RULES:
+            for m in rx.finditer(text):
+                if free(m.start(), m.end()):
+                    taken.append((m.start(), m.end()))
+                    self.report(path, line, rule, f"{msg}: {m.group(0)!r}")
+
+        for m in DOCKER_EXEC_RE.finditer(text):
+            target = self.docker_target(text[m.end():])
+            if target is not None:
+                taken.append((m.start(), m.end()))
+                self.report(path, line, "docker-exec",
+                            f"literal container name in `docker exec {target}`; use the profile's "
+                            "<section>.container (e.g. \"$LAKEHOUSE_SPARK_CONTAINER\")")
+
+        for m in PORT_RE.finditer(text):
+            port = m.group(1)
+            if not (0 < int(port) <= 65535) or FILE_REF_RE.search(text[: m.start() + 1]):
+                continue
+            if free(m.start(), m.end()):
+                taken.append((m.start(), m.end()))
+                self.report(path, line, "bare-port",
+                            f"hardcoded port ':{port}'; ports come from lakehouse profile endpoints")
+
+    @staticmethod
+    def docker_target(rest: str):
+        """Return the literal container token after `docker exec`, or None if it is a
+        variable/placeholder or absent (e.g. prose like "`docker exec` / k8s")."""
+        if rest.startswith("`") or not rest.strip():
+            return None
+        tokens = rest.split()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith("-") and len(tok) > 1:
+                i += 2 if (tok in DOCKER_VALUE_OPTS and "=" not in tok) else 1
+                continue
+            tok = tok.strip("`")
+            if not tok or tok.lstrip("\"'").startswith(("$", "<", "{{")) or tok in ("...", "…"):
+                return None
+            return tok
+        return None
+
+    def check_links(self, path: str, line: int, text: str) -> None:
+        for m in LINK_RE.finditer(text):
+            target = m.group(1).split("|", 1)[0].strip()
+            if target.startswith("<"):  # documented placeholder, e.g. [[<related-skill>]]
+                continue
+            if not self.skill_exists(target):
+                self.report(path, line, "link", f"[[{target}]] does not resolve to skills/{target}/SKILL.md")
+
+
+# -- self-test -------------------------------------------------------------------------
+GOOD = """---
+name: good-skill
+description: Load when testing the linter. Uses the lakehouse profile only.
+license: Apache-2.0
+compatibility: Requires tool >= 1.0 reachable via a lakehouse connection profile
+metadata:
+  version: "0.1.0"
+  parent: other-skill
+allowed-tools: [Bash, Read]
+---
+
+# Good
+
+Run `docker exec -it "$LAKEHOUSE_SPARK_CONTAINER" spark-sql` or `docker exec` / k8s.
+docker exec -u root <container> bash
+At 10:30 on 2026-10-21T10:30:00, slice x[:10], ratio 1:10, see load_profile.py:42.
+Endpoint "$LAKEHOUSE_KAFKA_BOOTSTRAP_SERVERS". See [[other-skill]] and [[<related-skill>]].
+"""
+
+BAD = """---
+name: wrong-name
+description: Bad skill.
+when_to_use: always
+metadata:
+  parent: nope
+---
+
+Connect to sc://localhost:15002 and localhost:8081 and 127.0.0.1:9000.
+docker exec kafka kafka-topics.sh --list
+UC on uc-server:8080, also :9092. See [[missing-skill]].
+"""
+
+BAD_EXPECT = {
+    "name": 1, "frontmatter-key": 1, "metadata": 1, "sc-localhost": 1, "localhost": 1,
+    "loopback-ip": 1, "docker-exec": 1, "bare-port": 2, "link": 1,
+}
+
+
+def self_test() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        for slug, text in (("good-skill", GOOD), ("other-skill", GOOD.replace("good-skill", "other-skill")),
+                           ("bad-skill", BAD)):
+            os.makedirs(os.path.join(tmp, slug))
+            with open(os.path.join(tmp, slug, "SKILL.md"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        linter = Linter(tmp)
+        linter.run()
+    failures = []
+    good = [v for v in linter.violations if "/good-skill/" in v or "/other-skill/" in v]
+    if good:
+        failures.append("spurious flags on clean skill:\n  " + "\n  ".join(good))
+    counts: dict[str, int] = {}
+    for v in linter.violations:
+        if "/bad-skill/" in v:
+            rule = v.split("[", 1)[1].split("]", 1)[0]
+            counts[rule] = counts.get(rule, 0) + 1
+    if counts != BAD_EXPECT:
+        failures.append(f"bad-skill rule counts {counts} != expected {BAD_EXPECT}")
+    for f in failures:
+        print(f"self-test FAIL: {f}", file=sys.stderr)
+    if failures:
+        return 1
+    print("self-test OK: clean fixture has 0 flags; bad fixture flags "
+          f"{sum(BAD_EXPECT.values())} expected violations")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    ap.add_argument("--skills-dir", default=os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "skills"), help="skills directory (default: <repo>/skills)")
+    ap.add_argument("--self-test", action="store_true", help="run built-in fixture tests and exit")
+    args = ap.parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if not os.path.isdir(args.skills_dir):
+        print(f"error: skills directory not found: {args.skills_dir}", file=sys.stderr)
+        return 2
+    linter = Linter(args.skills_dir)
+    n = linter.run()
+    rel = os.path.relpath(args.skills_dir)
+    for v in linter.violations:
+        print(v.replace(args.skills_dir, rel, 1))
+    if linter.violations:
+        print(f"lint_skills: {len(linter.violations)} violation(s) in {n} skill(s)", file=sys.stderr)
+        return 1
+    print(f"lint_skills: OK — {n} skill(s) clean")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

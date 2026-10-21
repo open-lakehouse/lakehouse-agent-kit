@@ -12,8 +12,8 @@ allowed-tools: [Bash, Read]
 # <Component> <version-range>
 
 <One paragraph grounding the skill: what engine/version this covers and how it connects —
-via the **lakehouse profile** (`$LAKEHOUSE_<X>_ENDPOINT`, etc.), NOT a hardcoded
-`localhost:PORT` or container name.>
+via the **lakehouse profile** (`$LAKEHOUSE_<SECTION>_<KEY>` values), NOT a hardcoded
+host, port, or container name.>
 
 **FIRST: use the parent skill `lakehouse-core`** to resolve the connection profile and
 verify the tool version floor before running anything here.
@@ -27,7 +27,7 @@ verify the tool version floor before running anything here.
 
 ```bash
 # profile-driven invocation — not a single deployment's exact command
-<cli> --endpoint "$LAKEHOUSE_<X>_ENDPOINT" ...
+<cli> --endpoint "$LAKEHOUSE_<SECTION>_<KEY>" ...
 ```
 
 ## Common pitfalls / gotchas
@@ -36,7 +36,7 @@ verify the tool version floor before running anything here.
 
 ## See also
 
-- [[lakehouse-core]], [[related-skill]]
+- [[lakehouse-core]], [[<related-skill>]]
 
 <!--
 Depth goes in references/<topic>.md and scripts/, loaded on demand. Keep this file

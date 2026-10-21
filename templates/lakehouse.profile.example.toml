@@ -4,50 +4,75 @@
 # mode a skill needs comes from a profile like this one — NOT from hardcoded hosts/ports.
 # `lakehouse-core` loads and validates the active profile and refuses to guess one.
 #
-# Copy to  lakehouse.profile.toml  (or export the env vars) and fill in your deployment.
+# Copy to  <name>.profile.toml  (e.g. lakehouse.profile.toml) in the working directory or
+# ~/.config/lakehouse/, or export the equivalent env vars (see
+# lakehouse.profile.example.env), and fill in your deployment.
 # A ready-made `reference-stack.profile.toml` reproduces the open-lakehouse compose values.
+#
+# Full field reference, file/env precedence and invocation modes: docs/connection-profile.md
+# Validate with:  python3 -I skills/lakehouse-core/scripts/load_profile.py --file <this file>
+#
+# Rules: only [profile] is required; every other section is optional, but a section that
+# is present must carry its required keys. Empty strings mean "unset". Secrets are never
+# written here — keys ending in `_env` hold the NAME of an env var that holds the secret.
 
 [profile]
-name = "default"
+name = "default"                         # required; what users pass as --profile / LAKEHOUSE_PROFILE
 
-# How skills invoke engine CLIs. One of: "local" | "docker" | "k8s".
+# How skills invoke engine CLIs. One of: "local" | "docker" | "k8s".  (required)
 # - local : binaries on PATH (spark-submit, spark-sql, kafka-*.sh, airflow, mlflow)
-# - docker: run inside named containers (set *_container below)
-# - k8s   : kubectl exec into pods (set *_pod/namespace below)
+# - docker: `docker exec` into the section's `container`
+# - k8s   : `kubectl exec` into the section's `pod`, in [k8s].namespace
+# CLI sections (spark, kafka, airflow, mlflow) may override this with their own `invocation`.
 invocation = "local"
 
+[k8s]
+# Required only when any effective invocation is "k8s".
+namespace = ""
+context   = ""                           # optional kubectl context; empty = current context
+
 [spark]
-connect_uri = "sc://SPARK_HOST:15002"   # Spark Connect endpoint
-container    = ""                        # used when invocation = "docker"
+connect_uri = "sc://SPARK_HOST:15002"    # required; Spark Connect endpoint (sc://host:port)
+container    = ""                        # required when invocation = "docker"
+pod          = ""                        # required when invocation = "k8s"
 image_notes  = ""                        # e.g. stock apache/spark image quirks, if relevant
 
 [unity_catalog]
-rest_url     = "http://UC_HOST:8080/api/2.1/unity-catalog"
-iceberg_rest = "http://UC_HOST:8080/api/2.1/unity-catalog/iceberg/v1"
+rest_url     = "http://UC_HOST:8080/api/2.1/unity-catalog"            # required
+iceberg_rest = "http://UC_HOST:8080/api/2.1/unity-catalog/iceberg/v1" # optional
 token_env    = "LAKEHOUSE_UC_TOKEN"      # name of the env var holding the token
 
 [kafka]
-bootstrap_servers = "KAFKA_HOST:9092"
+bootstrap_servers = "KAFKA_HOST:9092"    # required; comma-separated host:port list
 container          = ""
+pod                = ""
 
 [object_store]
-kind          = "s3"                     # s3-compatible (SeaweedFS, MinIO, AWS S3, …)
-s3_endpoint   = "http://OBJECT_STORE_HOST:8333"
-bucket        = "lakehouse"
-warehouse     = "s3://lakehouse/warehouse"
+kind           = "s3"                    # required; s3-compatible (SeaweedFS, MinIO, AWS S3, …)
+s3_endpoint    = "http://OBJECT_STORE_HOST:8333"   # required
+bucket         = "lakehouse"             # required
+warehouse      = "s3://lakehouse/warehouse"        # required; s3:// or s3a:// URI
+region         = ""                      # optional; e.g. "us-east-1"
+path_style     = true                    # optional; true for most self-hosted S3 stores
 access_key_env = "LAKEHOUSE_S3_ACCESS_KEY"
 secret_key_env = "LAKEHOUSE_S3_SECRET_KEY"
 
 [mlflow]
-tracking_uri = "http://MLFLOW_HOST:5000"
-gateway_uri  = "http://MLFLOW_HOST:5001"
+tracking_uri = "http://MLFLOW_HOST:5000" # required
+gateway_uri  = "http://MLFLOW_HOST:5001" # optional
+container    = ""
+pod          = ""
 
 [airflow]
-base_url   = "http://AIRFLOW_HOST:8080"
-container  = ""
+base_url     = "http://AIRFLOW_HOST:8080" # required
+container    = ""
+pod          = ""
+username_env = ""                         # optional; env var names for API basic auth
+password_env = ""
 
 [delta_sharing]
-endpoint = "https://SHARING_HOST:8443"
+endpoint         = "https://SHARING_HOST:8443"  # required
+bearer_token_env = ""                           # optional; env var holding the recipient token
 
 [naming]
 # Overridable defaults so skills don't assume one deployment's catalog/schema names.
