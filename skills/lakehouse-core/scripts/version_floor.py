@@ -5,8 +5,8 @@ Usage:  python3 -I version_floor.py "<raw tool --version output>" <floor>
         python3 -I version_floor.py --self-test
 
 The first argument may be the raw, multi-line output of a `--version` command; the
-version is the first dotted number following the word "version", else the first dotted
-number anywhere (e.g. "kafka-topics 3.6.1 (Commit: …)"). Comparison is numeric per
+version is the first dotted number following the word "version" on the same line (within
+~20 chars, e.g. "tool version is 4.0.0"), else the first dotted number anywhere (e.g. "kafka-topics 3.6.1 (Commit: …)"). Comparison is numeric per
 component with missing components treated as 0 (4.0 == 4.0.0); pre-release suffixes
 (4.0.0-preview1) compare as the release.
 
@@ -19,7 +19,8 @@ import re
 import sys
 
 DOTTED = r"\d+(?:\.\d+)+"
-AFTER_WORD_RE = re.compile(r"\bversion\b\D{0,3}(" + DOTTED + r")", re.I)
+# "version" followed (on the same line, within a short phrase) by the dotted number.
+AFTER_WORD_RE = re.compile(r"\bversion\b[^\d\r\n]{0,20}(" + DOTTED + r")", re.I)
 ANY_RE = re.compile(r"(?<![\w.])(" + DOTTED + r")")
 FLOOR_RE = re.compile(r"^\d+(?:\.\d+)*$")
 
@@ -47,6 +48,8 @@ def self_test() -> int:
         ("mlflow, version 2.21.0", "2.9", 0),   # numeric, not lexical: 21 > 9
         ("4.0", "4.0.0", 0),                     # missing components are 0
         ("4.0.0-preview1", "4.0", 0),
+        ("Built 2026.10.21; tool version is 4.0.0", "4.0", 0),   # not the build date
+        ("Built 2026.10.21; tool version is 3.9.0", "4.0", 1),
         ("command not found", "1.0", 2),
     ]
     failures = []

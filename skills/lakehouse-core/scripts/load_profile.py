@@ -31,7 +31,7 @@ import shlex
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 try:
     import tomllib  # Python >= 3.11
@@ -71,13 +71,18 @@ INLINE_SECRET_KEYS = {"token", "password", "secret", "secret_key", "access_key",
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLACEHOLDER_HOST_RE = re.compile(r"^[A-Z][A-Z0-9_]*_HOST$")
-# Query / `;param=` names that carry credentials (compared lower-case, `-` -> `_`).
+# Query / `;param=` / fragment names that carry credentials (compared percent-decoded,
+# lower-case, `-` -> `_`).
 SECRET_URI_PARAMS = {
     "token", "access_token", "session_token", "bearer", "auth", "authorization", "password",
     "passwd", "pwd", "secret", "client_secret", "api_key", "apikey", "key", "credential",
+    "access_key", "secret_key", "access_key_id", "secret_access_key", "aws_access_key_id",
+    "aws_secret_access_key", "aws_session_token",
     "sig", "signature", "x_amz_signature", "x_amz_credential", "x_amz_security_token",
 }
-URI_PARAM_RE = re.compile(r"([;?&])([A-Za-z0-9_.-]+)=([^;&#]*)")
+URI_PARAM_RE = re.compile(r"([;?&#])([A-Za-z0-9_.%-]+)=([^;&#]*)")
+# Characters that never belong in a host:port entry (they start params / userinfo).
+HOSTPORT_FORBIDDEN = set("@?;&#/")
 
 
 class ProfileError(Exception):
@@ -240,27 +245,35 @@ def select(args, environ: dict, cwd: str, home: str):
 
 # -- validation ------------------------------------------------------------------------
 def hosts_of(kind: str, value: str) -> list[str]:
+    """Hosts of an already-validated value (check_value returned it, so parsing succeeds)."""
     if kind == "hostports":
         return [hp.rsplit(":", 1)[0].strip("[]") for hp in value.split(",")]
     # urlparse().hostname lower-cases; keep case so *_HOST placeholders are detectable.
-    netloc = urlparse(value).netloc.rsplit("@", 1)[-1]
+    try:
+        netloc = urlparse(value).netloc.rsplit("@", 1)[-1]
+    except ValueError:
+        return []
     if netloc.startswith("[") and "]" in netloc:  # IPv6 literal
         return [netloc[1:netloc.index("]")]]
     return [netloc.split(":", 1)[0]]
 
 
-def uri_secret_params(tail: str) -> list[str]:
-    return [m.group(2) for m in URI_PARAM_RE.finditer(tail)
-            if m.group(2).lower().replace("-", "_") in SECRET_URI_PARAMS]
+def is_secret_param(name: str) -> bool:
+    return unquote(name).lower().replace("-", "_") in SECRET_URI_PARAMS
 
 
-def redact(value: str) -> str:
-    """Mask userinfo and credential-like params so error messages never echo secrets."""
-    value = re.sub(r"(//)[^/@]*@", r"\1***@", value) if "//" in value else \
-        re.sub(r"(^|,)\s*[^,@]*@", r"\1***@", value)
-    return URI_PARAM_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}=***"
-        if m.group(2).lower().replace("-", "_") in SECRET_URI_PARAMS else m.group(0), value)
+def secret_params(text: str) -> list[str]:
+    """Names (never values) of credential-like parameters anywhere in `text`."""
+    return sorted({unquote(m.group(2)) for m in URI_PARAM_RE.finditer(text) if is_secret_param(m.group(2))})
+
+
+def credential_errors(where: str, value: str) -> list[str]:
+    errs = []
+    names = secret_params(value)
+    if names:
+        errs.append(f"{where}: credential parameter(s) {', '.join(names)} are not allowed; "
+                    "reference secrets by env-var name via a *_env key")
+    return errs
 
 
 def check_value(where: str, kind: str, value, errors: list[str]):
@@ -302,31 +315,45 @@ def check_value(where: str, kind: str, value, errors: list[str]):
                           "never the secret itself")
     elif kind in ("http_url", "sc_uri", "s3_uri"):
         schemes = {"http_url": ("http", "https"), "sc_uri": ("sc",), "s3_uri": ("s3", "s3a")}[kind]
-        u = urlparse(value)
+        errs = credential_errors(where, value)
+        scheme = value.split("://", 1)[0] if "://" in value else ""
         try:
+            u = urlparse(value)
             u.port  # raises ValueError on a non-numeric/out-of-range port
-            ok = u.scheme in schemes and bool(u.netloc)
-        except ValueError:
-            ok = False
+            ok = u.scheme in schemes and bool(u.hostname)
+            userinfo = "@" in u.netloc
+        except ValueError:  # e.g. unbalanced IPv6 brackets, non-numeric port
+            ok, userinfo = False, "@" in value.split("//", 1)[-1].split("/", 1)[0]
         if not ok:
-            errors.append(f"{where}: {redact(value)!r} must be a "
-                          f"{' or '.join(s + '://' for s in schemes)} URI")
-        if "@" in u.netloc:
-            errors.append(f"{where}: credentials in URI userinfo (user:password@) are not allowed; "
-                          "reference them by env-var name via a *_env key")
-        tail = value.split(u.netloc, 1)[1] if u.netloc else value
-        bad = uri_secret_params(tail)
-        if bad:
-            errors.append(f"{where}: credential parameter(s) {', '.join(sorted(set(bad)))} are not "
-                          "allowed in the URI; reference secrets by env-var name via a *_env key")
+            # URI and host:port values are never echoed in errors: a malformed one may hold
+            # a secret where the port should be (e.g. `http://user:pass`).
+            errs.append(f"{where}: must be a {' or '.join(s + '://' for s in schemes)} URI with a "
+                        f"host and an optional numeric port (got scheme {scheme[:10]!r}; value not shown)")
+        if userinfo:
+            errs.append(f"{where}: credentials in URI userinfo (user:password@) are not allowed; "
+                        "reference them by env-var name via a *_env key")
+        if errs:
+            errors.extend(errs)
+            return None  # never hand an invalid URI to hosts_of() or the output
     elif kind == "hostports":
         parts = [p.strip() for p in value.split(",") if p.strip()]
-        for p in parts:
+        errs = credential_errors(where, value)
+        for n, p in enumerate(parts, start=1):
             host, _, port = p.rpartition(":")
             if "@" in p:
-                errors.append(f"{where}: credentials (user@) are not allowed in host:port entries")
-            elif not host or not port.isdigit() or not 0 < int(port) <= 65535:
-                errors.append(f"{where}: {p!r} must be host:port")
+                errs.append(f"{where}: entry {n}: credentials (user@) are not allowed in host:port")
+            elif HOSTPORT_FORBIDDEN & set(p):
+                # Never echo: anything after ?/;/&/# may be a secret even if its name isn't listed.
+                errs.append(f"{where}: entry {n}: must be plain host:port "
+                            f"(no {' '.join(sorted(HOSTPORT_FORBIDDEN - {'@'}))} characters)")
+            elif not host:
+                errs.append(f"{where}: entry {n}: must be host:port (missing host)")
+            elif not port.isdigit() or not 0 < int(port) <= 65535:
+                # Show the host only; a bad "port" may be a password typed as user:pass.
+                errs.append(f"{where}: entry {n} (host {host!r}): port must be a number 1-65535")
+        if errs:
+            errors.extend(errs)
+            return None
         value = ",".join(parts)
     return value
 
@@ -638,9 +665,44 @@ def self_test() -> int:
                and all(k in err for k in ("unity_catalog.rest_url: credentials in URI userinfo",
                                           "mlflow.tracking_uri: credentials in URI userinfo",
                                           "spark.connect_uri: credential parameter(s) token",
-                                          "kafka.bootstrap_servers: credentials",
+                                          "kafka.bootstrap_servers: entry 1: credentials",
                                           "delta_sharing.endpoint: credential parameter(s) api_key")),
                f"leaked={leaked}\n{err}")
+
+        # (section, key, value, expected stderr fragment). Every value embeds the marker
+        # SECRETVAL, which must never reach stdout or stderr.
+        leak_cases = [
+            ("kafka", "bootstrap_servers", "k1.internal:9092?token=SECRETVAL", "credential parameter(s) token"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092;api_key=SECRETVAL", "credential parameter(s) api_key"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092&X-Amz-Signature=SECRETVAL",
+             "credential parameter(s) X-Amz-Signature"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092?opaque=SECRETVAL", "must be plain host:port"),
+            ("kafka", "bootstrap_servers", "k1.internal:SECRETVAL?x=1", "must be plain host:port"),
+            ("kafka", "bootstrap_servers", "k1.internal:9092,SECRETVAL@k2:9092", "entry 2: credentials"),
+            ("object_store", "s3_endpoint", "https://s3.internal/?aws_access_key_id=SECRETVAL",
+             "credential parameter(s) aws_access_key_id"),
+            ("object_store", "s3_endpoint", "https://s3.internal/?secret_key=SECRETVAL",
+             "credential parameter(s) secret_key"),
+            ("mlflow", "tracking_uri", "https://mlflow.internal/?to%6ben=SECRETVAL", "credential parameter(s) token"),
+            ("mlflow", "tracking_uri", "https://mlflow.internal/#access_token=SECRETVAL",
+             "credential parameter(s) access_token"),
+            ("mlflow", "tracking_uri", "http://SECRETVAL@[::1", "credentials in URI userinfo"),
+            ("mlflow", "tracking_uri", "http://[::1", "URI with a host"),
+            ("mlflow", "tracking_uri", "http://:8080", "URI with a host"),
+            ("mlflow", "tracking_uri", "http://mlflow.internal:SECRETVAL", "URI with a host"),
+            ("kafka", "bootstrap_servers", "k1.internal:SECRETVAL", "port must be a number"),
+            ("kafka", "bootstrap_servers", ":SECRETVAL", "missing host"),
+            ("spark", "connect_uri", "sc://[spark.internal:15002/;token=SECRETVAL", "credential parameter(s) token"),
+        ]
+        bad_syntax = []
+        for section, key, value, fragment in leak_cases:
+            extra = {"object_store": 'kind = "s3"\nbucket = "b"\nwarehouse = "s3://b/w"\n'}.get(section, "")
+            body = f'[profile]\nname = "leak"\ninvocation = "local"\n[{section}]\n{key} = "{value}"\n{extra}'
+            code, out, err = _call(["--file", write("leak.profile.toml", body)], {}, aux)
+            if code != 1 or "SECRETVAL" in out + err or fragment not in err or "Traceback" in err:
+                bad_syntax.append(f"{value!r}: code={code} out={out!r} err={err!r}")
+        expect(f"{len(leak_cases)} credential / malformed-URI syntaxes rejected (exit 1, no traceback), "
+               "secret absent from stdout+stderr", not bad_syntax, "\n".join(bad_syntax))
 
         code, out, err = _call(["--file", aux], {}, aux)
         expect("unsupported path (directory without extension) -> exit 2", code == 2, err)

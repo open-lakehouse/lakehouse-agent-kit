@@ -177,8 +177,10 @@ environment variable (must match `[A-Z_][A-Z0-9_]*`). Keys that look like inline
 (`token`, `password`, `secret`, `secret_key`, `access_key`, `bearer_token`, `api_key`) are
 rejected, as are credentials embedded in any URI or `host:port` field — userinfo
 (`https://user:pass@host`, `user@host:port`) or credential parameters such as
-`?token=`, `?api_key=`, `X-Amz-Signature=`, or Spark Connect's `;token=`. Error messages
-mask such values. The loader reports each referenced variable as `set` / `unset` in
+`?token=`, `?api_key=`, `X-Amz-Signature=`, `aws_access_key_id=`, or Spark Connect's
+`;token=` (names are percent-decoded before matching). `host:port` fields additionally
+reject `? ; & # /` outright. Errors name the field, entry, and parameter **names** only —
+URI and `host:port` values are never echoed. The loader reports each referenced variable as `set` / `unset` in
 `_meta.secrets` and never prints a value.
 
 ## Invocation modes
