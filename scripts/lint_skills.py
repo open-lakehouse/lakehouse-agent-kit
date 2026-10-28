@@ -230,14 +230,27 @@ class Linter:
 
     @classmethod
     def resolver_lines(cls, lines: list[str], fences: list, start: int = 0) -> list[int]:
-        """Indices of lines that really invoke the resolver. Shell state is carried across
-        each fenced block (ShellState): a logical line (backslash-continued lines joined)
-        counts only if it STARTS and ENDS in a clean state — not inside a heredoc body, a
-        multi-line '...' / "..." literal, an open $( / ` / ( construct, or after anything
-        the scanner could not track. Ambiguity means NOT executed, so these constructs can
-        only lose the exemption, never grant it."""
+        """Indices of lines that really invoke the resolver.
+
+        COUNTING CONTRACT (conservative by construction). A fenced line counts as a real
+        resolver invocation ONLY if it is a plain command executed at the TOP LEVEL of its
+        fenced block — or inside a `$(...)` / backtick substitution on such a top-level
+        line — which means ALL of:
+          * it starts in a clean ShellState: not in a heredoc body, not inside an open
+            quote / `$(` / backtick / `(` from an earlier line, compound depth 0, no
+            function body pending, and nothing earlier in the block was untrackable;
+          * it is one physical line, or backslash-continued lines — never a unit spanning
+            lines via an open quote / substitution / subshell;
+          * it opens, closes, or continues NO compound construct: function definitions
+            (`name() {...}`, `function name {...}`), brace groups `{ ...; }`, subshells
+            `( ... )`, and `if/then/elif/else/fi`, `for|while|until ... do ... done`,
+            `case ... esac`, `select` (ShellState.compound);
+          * and is_resolver_command() accepts one of its simple commands.
+        Anything the scanner cannot classify sets the sticky `broken` flag, after which
+        nothing else in the block counts. Every construct the linter does not model as
+        executing therefore LOSES the exemption; none can gain it."""
         found: list[int] = []
-        state, logical, first, start_clean = None, "", None, False
+        state, logical, first, start_clean, spanned = None, "", None, False, False
         for i in range(start, len(lines)):
             info, marker = fences[i]
             if info is None or marker:  # outside a fence, or a fence marker: reset state
@@ -248,13 +261,18 @@ class Linter:
             if not logical and state.in_heredoc(lines[i]):  # heredoc body / delimiter
                 continue
             if not logical:
-                start_clean, first = state.clean(), i
+                start_clean, first, spanned = state.clean(), i, False
             logical += lines[i]
             state.feed(lines[i])
-            if state.continued:
+            if state.continued:              # backslash-newline: same logical line
                 logical = logical[:-1] + " "
                 continue
-            if start_clean and state.clean(after_line=True) \
+            if state.stack and not state.broken:  # open quote/substitution/subshell
+                logical += "\n"
+                spanned = True
+                continue
+            plain = state.compound(logical)  # updates compound depth for the whole unit
+            if start_clean and not spanned and plain and not state.broken \
                     and cls.invokes_resolver(logical, fences[i]):
                 found.append(first)
             logical = ""
@@ -454,15 +472,23 @@ class Linter:
 
 
 # -- shell command-position parsing (for the resolver-invocation check) ------------------
+# Compound-command syntax recognised in command position (ShellState.compound).
+COMPOUND_OPEN = {"if", "while", "until", "for", "case", "select", "{"}
+COMPOUND_OPEN_WORDLIST = {"for", "case", "select"}
+COMPOUND_MIDDLE = {"then", "do", "else", "elif"}
+COMPOUND_CLOSE = {"fi", "done", "esac", "}"}
+FUNC_DEF_RE = re.compile(r"[A-Za-z_][\w:.-]*\(\)")
 HEREDOC_RE = re.compile(r"""<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.@%+-]+))""")
 
 
 class ShellState:
     """Cross-line shell lexer state for one fenced block: open quotes / substitutions /
     subshells (a stack), heredocs announced on the current line (pending) and the one
-    whose body is being read, backslash-newline continuation, and a sticky `broken` flag
-    for anything it cannot classify (unbalanced `)`, unparseable `<<`). Approximate on
-    purpose — every approximation errs toward "not clean"."""
+    whose body is being read, backslash-newline continuation, the compound-command depth
+    (function bodies, `{ }`, if/for/while/until/case/select) with a pending function
+    body, and a sticky `broken` flag for anything it cannot classify (unbalanced `)` —
+    including `case` patterns —, unparseable `<<`, a closer without an opener).
+    Approximate on purpose — every approximation errs toward "not clean"."""
 
     def __init__(self):
         self.stack: list[str] = []
@@ -470,12 +496,80 @@ class ShellState:
         self.heredoc = None  # (delimiter, strip_leading_tabs)
         self.continued = False
         self.broken = False
+        self.depth = 0       # open compound commands (reserved words / braces)
+        self.func_pending = False  # saw `name()` / `function name`, body not opened yet
 
-    def clean(self, after_line: bool = False) -> bool:
-        """No open construct. `after_line`: heredocs the line just announced are fine (the
-        announcing line itself still executes)."""
-        busy = self.heredoc is not None and not after_line or (self.pending and not after_line)
-        return not (self.stack or busy or self.broken)
+    def clean(self) -> bool:
+        """At top level with nothing open: the next line could be a top-level command."""
+        return not (self.stack or self.heredoc is not None or self.pending or self.broken
+                    or self.depth or self.func_pending)
+
+    def compound(self, text: str) -> bool:
+        """Update the compound depth from the words in command position of a complete
+        logical unit. True only if the unit is plain: depth 0 before and after, and it
+        neither opens, closes, nor continues any compound construct."""
+        split = _split_line(text)
+        if split is None:
+            self.broken = True
+            return False
+        touched = self.func_pending
+        for tokens in split[0]:                 # top-level simple commands only
+            i = 0
+            while i < len(tokens):
+                t = tokens[i]
+                if self.func_pending:           # a function's body must open next
+                    self.func_pending = False
+                    if t == "{":
+                        self.depth += 1
+                        i += 1
+                        continue
+                    if not t.startswith("("):   # `(` body: the paren stack tracks it
+                        self.broken = True
+                    break
+                if t in COMPOUND_OPEN:
+                    self.depth += 1
+                    touched = True
+                    if t in COMPOUND_OPEN_WORDLIST:   # `for x in ...`: rest are words
+                        break
+                    i += 1                      # `{ cmd`, `if cmd`, `while cmd`, ...
+                    continue
+                if t in COMPOUND_MIDDLE:        # then / do / else / elif: inside only
+                    touched = True
+                    if not self.depth:
+                        self.broken = True
+                    i += 1
+                    continue
+                if t in COMPOUND_CLOSE:
+                    touched = True
+                    self.depth -= 1
+                    if self.depth < 0:
+                        self.broken, self.depth = True, 0
+                    i += 1
+                    continue
+                if t == "function":             # function name [()] [{]
+                    touched = True
+                    rest = tokens[i + 2:]
+                    if rest[:1] == ["()"]:
+                        rest = rest[1:]
+                    if rest[:1] == ["{"]:
+                        self.depth += 1
+                    elif rest:
+                        self.broken = True
+                    else:
+                        self.func_pending = True
+                    break
+                if FUNC_DEF_RE.fullmatch(t) or tokens[i + 1:i + 2] == ["()"]:
+                    touched = True              # name() [{]  /  name () [{]
+                    rest = tokens[i + (1 if FUNC_DEF_RE.fullmatch(t) else 2):]
+                    if rest[:1] == ["{"]:
+                        self.depth += 1
+                    elif rest and not rest[0].startswith("("):
+                        self.broken = True
+                    elif not rest:
+                        self.func_pending = True
+                    break
+                break                           # an ordinary command: rest are arguments
+        return touched is False and self.depth == 0 and not self.func_pending
 
     def in_heredoc(self, text: str) -> bool:
         """Consume `text` if it is heredoc body or the closing delimiter line."""
@@ -544,6 +638,8 @@ class ShellState:
                 continue
             i += 1
         if not self.continued and self.pending and self.heredoc is None:
+            if self.stack:  # heredoc body would start inside an open construct: give up
+                self.broken = True
             self.heredoc = self.pending.pop(0)  # bodies start on the next line
 
 
@@ -571,11 +667,9 @@ def _close_paren(s: str, i: int):
     return None
 
 
-def shell_commands(line: str) -> list:
-    """Every simple command a shell would EXECUTE on this line, as token lists: the top
-    level (split on ; && || | &) plus, recursively, `$(...)` / backtick substitution bodies
-    (which execute even inside double quotes). Single-quoted text, double-quoted literal
-    text, and `# comments` never yield commands. Unparseable input yields nothing."""
+def _split_line(line: str):
+    """(top-level simple commands as token lists, substitution bodies) for one logical
+    line, or None if it cannot be parsed (unbalanced quote / substitution)."""
     top, subs, q, i = [], [], None, 0
     while i < len(line):
         c = line[i]
@@ -591,7 +685,7 @@ def shell_commands(line: str) -> list:
         if line.startswith("$(", i) and not line.startswith("$((", i):
             j = _close_paren(line, i + 2)
             if j is None:
-                return []
+                return None
             subs.append(line[i + 2:j])
             top.append("SUBST")
             i = j + 1
@@ -599,7 +693,7 @@ def shell_commands(line: str) -> list:
         if c == "`":
             j = line.find("`", i + 1)
             if j < 0:
-                return []
+                return None
             subs.append(line[i + 1:j])
             top.append("SUBST")
             i = j + 1
@@ -618,7 +712,7 @@ def shell_commands(line: str) -> list:
         lex.commenters = ""
         tokens = list(lex)
     except ValueError:
-        return []
+        return None
     cmds, cur = [], []
     for tok in tokens:
         if tok and set(tok) <= set(";&|"):
@@ -627,9 +721,21 @@ def shell_commands(line: str) -> list:
         else:
             cur.append(tok)
     cmds.append(cur)
+    return [c for c in cmds if c], subs
+
+
+def shell_commands(line: str) -> list:
+    """Every simple command a shell would EXECUTE on this line, as token lists: the top
+    level (split on ; && || | &) plus, recursively, `$(...)` / backtick substitution bodies
+    (which execute even inside double quotes). Single-quoted text, double-quoted literal
+    text, and `# comments` never yield commands. Unparseable input yields nothing."""
+    split = _split_line(line)
+    if split is None:
+        return []
+    cmds, subs = split
     for body in subs:
-        cmds.extend(shell_commands(body))
-    return [c for c in cmds if c]
+        cmds = cmds + shell_commands(body)
+    return cmds
 
 
 def is_resolver_command(tokens: list) -> bool:
@@ -694,6 +800,30 @@ MULTILINE_BLOCKS = (
      "python3 -I scripts/resolve_endpoint.py \\\n  spark.connect_uri --format env", True),
     ("here-string is not a heredoc", f"cat <<< hi\n{R}", True),
     ("real eval form", f'eval "$({R} --profile "<name>" --format env)"', True),
+    # compound constructs: never counted inside, counted again once closed
+    ("function name() { }", f"fake() {{\n  {R}\n}}", False),
+    ("function name() newline {", f"fake()\n{{\n  {R}\n}}", False),
+    ("function keyword", f"function fake {{\n  {R}\n}}", False),
+    ("one-line function", f"fake() {{ {R}; }}", False),
+    ("if/then/fi", f"if true; then\n  {R}\nfi", False),
+    ("if on one line", f"if true; then {R}; fi", False),
+    ("else branch", f"if false; then\n  :\nelse\n  {R}\nfi", False),
+    ("multi-line subshell", f"(\n  {R}\n)", False),
+    ("one-line subshell", f"( {R} )", False),
+    ("for loop", f"for x in a b; do\n  {R}\ndone", False),
+    ("while loop", f"while true; do\n  {R}\ndone", False),
+    ("until loop", f"until false\ndo\n  {R}\ndone", False),
+    ("case arm", f"case $x in\n  a) {R} ;;\nesac", False),
+    ("select", f"select x in a b; do\n  {R}\ndone", False),
+    ("brace group", f"{{\n  {R}\n}}", False),
+    ("one-line brace group", f"{{ {R}; }}", False),
+    ("nested if in function", f"f() {{\n  if true; then\n    :\n  fi\n  {R}\n}}", False),
+    ("if inside $( )", f'x="$(if true; then {R}; fi)"', False),
+    ("stray closer poisons the block", f"fi\n{R}", False),
+    ("after a function closes", f"f() {{\n  :\n}}\n{R}", True),
+    ("after if/fi closes", f"if true; then\n  :\nfi\n{R}", True),
+    ("after a loop closes", f"for x in a; do\n  :\ndone\n{R}", True),
+    ("&& list at top level", f"cd skills/lakehouse-core && {R}", True),
 )
 
 
@@ -866,6 +996,13 @@ description: Load when testing that a resolver line inside a {what} is not an in
 The preferred default is `sc://<host>:15002`.
 """
 CONSTRUCT_FIXTURES = {
+    "funcdef-skill": ("function definition", "fake() {\n  " + R + "\n}"),
+    "funckeyword-skill": ("function keyword definition", "function fake {\n  " + R + "\n}"),
+    "if-skill": ("if block", "if true; then\n  " + R + "\nfi"),
+    "subshell-skill": ("subshell", "(\n  " + R + "\n)"),
+    "loop-skill": ("for / while loop", "for x in a; do\n  " + R + "\ndone\nwhile false; do\n  "
+                   + R + "\ndone"),
+    "brace-skill": ("brace group", "{ " + R + "; }"),
     "heredoc-quoted-skill": ("quoted heredoc", "cat <<'EOF'\n" + R + "\nEOF"),
     "heredoc-unquoted-skill": ("unquoted heredoc", "cat <<EOF\n" + R + "\nEOF"),
     "squote-multiline-skill": ("multi-line single-quoted string", "note='start\n" + R + "\nend'"),
@@ -941,7 +1078,8 @@ def self_test() -> int:
     print(f"self-test OK: {len(clean)} clean fixtures have 0 flags; bad fixtures flag "
           f"{sum(BAD_EXPECT.values())} + {sum(BAD_RESOLVER_EXPECT.values())} + "
           f"{sum(MENTION_ONLY_EXPECT.values())} expected violations; {len(CONSTRUCT_FIXTURES)} "
-          "heredoc / multi-line-literal skills keep their labeled port flagged; "
+          "heredoc / multi-line-literal / compound-construct skills keep their labeled port "
+          "flagged; "
           f"escaping symlink dir rejected; {len(INVOCATIONS_OK)} invocation / "
           f"{len(INVOCATIONS_BAD)} non-invocation command lines and {len(MULTILINE_BLOCKS)} "
           "multi-line blocks classified correctly")

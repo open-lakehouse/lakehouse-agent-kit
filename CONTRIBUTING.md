@@ -106,7 +106,9 @@ only when both hold:
   prose or HTML comments, or in `output` / `text` / `log` / `markdown` fences. Shell state
   carries across lines of a fence, so a line inside a heredoc body (`<<EOF`, `<<-EOF`,
   `<<'EOF'`, `<<"EOF"`), a multi-line quoted string, or a multi-line `$(…)` does not count
-  either — when executability is ambiguous, it does not count; and
+  either, nor does one inside any compound command — function definitions, `{ …; }`,
+  `( … )`, `if`/`for`/`while`/`until`/`case`/`select`. Only plain top-level commands (and
+  `$(…)` substitutions on them) count; when executability is ambiguous, it does not count; and
 - the literal is labeled: the same line says "preferred default", "prefer…" or
   "conventional", **or** it sits under a heading containing "Preferred default(s)" (the
   context lasts until the next heading of the same or a higher level).
