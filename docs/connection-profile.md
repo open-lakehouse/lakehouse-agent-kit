@@ -13,7 +13,26 @@ Templates:
 - [`templates/lakehouse.profile.example.env`](../templates/lakehouse.profile.example.env)
 
 Both encode the same contract; the loader normalizes them to identical output (its
-`--self-test` checks this).
+`--self-test` checks this). They target a **generic** stack with each service on its
+upstream conventional port (Unity Catalog OSS 8080, MinIO-style S3 9000, …) — not
+necessarily the open-lakehouse reference stack. Fill in your own hosts and ports.
+
+### The reference-stack profile
+
+The [open-lakehouse](https://github.com/open-lakehouse/open-lakehouse) Docker Compose
+stack ships its own ready-to-use profile, verified value by value against its compose
+files (commit and `path:line` cited inline):
+
+- [`templates/reference-stack.profile.toml`](../templates/reference-stack.profile.toml)
+- [`templates/reference-stack.profile.env`](../templates/reference-stack.profile.env)
+
+It is a different deployment with its own remaps — Unity Catalog on host port 8081,
+Airflow on 8085, SeaweedFS S3 on 8333, Delta Sharing at `https://localhost:8443/delta-sharing`
+— and `invocation = "docker"` with the stack's container names. Select it explicitly
+(`--file templates/reference-stack.profile.toml`, or copy it to `~/.config/lakehouse/`
+and pass `--profile reference-stack`); it is never auto-selected. Its values are
+**config** for the resolver (tier 1), so they win over any generic preferred default;
+the generic defaults themselves are unchanged by it.
 
 ## Quickstart
 

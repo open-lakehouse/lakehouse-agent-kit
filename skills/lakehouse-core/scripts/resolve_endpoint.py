@@ -635,6 +635,40 @@ def self_test() -> int:
         else:
             print("  skip template port parity (templates/ not found next to this skill)")
 
+        # The shipped reference-stack profile is a DIFFERENT deployment (its own remaps); it
+        # must load strictly and resolve out of the box, and is never held to generic defaults.
+        ref_dir = os.path.dirname(tmpl)
+        ref_toml = os.path.join(ref_dir, "reference-stack.profile.toml")
+        ref_env = os.path.join(ref_dir, "reference-stack.profile.env")
+        if os.path.isfile(ref_toml) and os.path.isfile(ref_env) and lp.tomllib is not None:
+            loaded = []
+            for f in (ref_toml, ref_env):
+                o, e = io.StringIO(), io.StringIO()
+                with redirect_stdout(o), redirect_stderr(e):
+                    c = lp.run(["--file", f, "--no-env-overrides"], {}, tmp, tmp)
+                body = json.loads(o.getvalue()) if c == 0 else {}
+                body.pop("_meta", None)
+                loaded.append((c, body))
+            expect("reference-stack.profile.toml / .env validate strictly (no placeholders) and agree",
+                   all(c == 0 for c, _ in loaded) and loaded[0][1] == loaded[1][1], str(loaded)[:300])
+            want = {"unity_catalog.rest_url": "http://localhost:8081/api/2.1/unity-catalog",
+                    "object_store.s3_endpoint": "http://localhost:8333",
+                    "airflow.base_url": "http://localhost:8085",
+                    "spark.connect_uri": "sc://localhost:15002",
+                    "kafka.bootstrap_servers": "localhost:9092",
+                    "mlflow.tracking_uri": "http://localhost:5000",
+                    "delta_sharing.endpoint": "https://localhost:8443/delta-sharing"}
+            bad = []
+            for ep, val in want.items():
+                code, out, err = _call([ep, "--file", ref_toml, "--format", "json"], env, tmp, nothing)
+                res = json.loads(out) if code == 0 else {}
+                if res.get("tier") != "config" or res.get("value") != val:
+                    bad.append((ep, code, res.get("value"), err[-200:]))
+            expect(f"reference-stack profile resolves {len(want)} endpoints via config (UC 8081, "
+                   "SeaweedFS 8333, Airflow 8085 — its own remaps, not generic defaults)", not bad, str(bad))
+        else:
+            print("  skip reference-stack profile check (templates/ not found next to this skill)")
+
         # fail-loud-when-unreachable.
         for ep in ENDPOINTS:
             code, out, err = _call([ep], env, tmp, nothing)

@@ -199,8 +199,10 @@ name of an exported variable (`export MY_SPARK=…; … --candidate-env MY_SPARK
 
 These are generic upstream conventions and match `templates/lakehouse.profile.example.*`
 (the resolver self-test checks this). A deployment that remaps a port — e.g. UC on 8081 to
-avoid Airflow's 8080 — records it in its own profile, never here. Note UC and Airflow
-share 8080: a reachable preferred default proves only that *something* listens there.
+avoid Airflow's 8080 — records it in its own profile, never here; the open-lakehouse
+reference stack's profile is `templates/reference-stack.profile.{toml,env}` in the repo.
+Note the generic UC and Airflow defaults share 8080: a reachable preferred default proves
+only that *something* listens there.
 
 **Topology only.** The resolver answers *where a service listens*. It never selects a
 profile — with no `--profile`/`--file`/`LAKEHOUSE_PROFILE*` it reads only `LAKEHOUSE_*`

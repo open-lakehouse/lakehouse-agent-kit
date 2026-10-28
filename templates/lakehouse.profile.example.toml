@@ -7,7 +7,9 @@
 # Copy to  <name>.profile.toml  (e.g. lakehouse.profile.toml) in the working directory or
 # ~/.config/lakehouse/, or export the equivalent env vars (see
 # lakehouse.profile.example.env), and fill in your deployment.
-# A ready-made `reference-stack.profile.toml` reproduces the open-lakehouse compose values.
+# This example targets a GENERIC stack (each service on its upstream conventional port).
+# For the open-lakehouse compose stack use the ready-made reference-stack.profile.toml
+# next to this file instead — it carries that stack's own remaps (UC 8081, S3 8333, ...).
 #
 # Full field reference, file/env precedence and invocation modes: docs/connection-profile.md
 # Validate with:  python3 -I skills/lakehouse-core/scripts/load_profile.py --file <this file>
