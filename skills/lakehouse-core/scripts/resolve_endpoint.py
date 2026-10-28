@@ -28,13 +28,24 @@ warehouse, credentials) — those are confirmed with the user (load_profile.py).
 
 No-secret-echo: configured values are validated with load_profile.check_value (userinfo
 and credential parameters are rejected with value-free messages); only validated config
-values, docker-derived hosts, and integer ports ever reach stdout/stderr. --candidate
-text is never echoed anywhere: a winning candidate is reported as `candidate #N`.
+values, docker-derived hosts, and integer ports ever reach stdout/stderr. Candidate text
+is never echoed anywhere; candidates are referred to by position (`#N`).
 
-Output: the resolved value on stdout (--format text, default), a JSON object
-(--format json), or one `export` line (--format env); provenance goes to stderr. When a
---candidate wins, the value is withheld (the caller holds it): text prints `candidate #N`,
-env prints `export LAKEHOUSE_RESOLVED_CANDIDATE=N`, JSON has "candidate": N, "value": null.
+Candidates: `--candidate-env VAR` (preferred) names an exported env var holding host[:port];
+`--candidate HOST[:PORT]` passes it by value. Both are probed in command-line order.
+
+Output (`--format env` is the consumable contract — eval it to set LAKEHOUSE_<SECTION>_<KEY>):
+  config / docker discovery / preferred default
+          export LAKEHOUSE_<SECTION>_<KEY>='<validated value>'
+  --candidate-env VAR wins
+          export LAKEHOUSE_<SECTION>_<KEY>="sc://${VAR}[:port][/path]"   (indirect: the value
+          is expanded by the caller's shell at eval time, never printed by the resolver)
+  --candidate (by value) wins
+          export LAKEHOUSE_RESOLVED_CANDIDATE=N   — index only; the endpoint variable is NOT
+          set, because a by-value candidate cannot be safely echoed. Use --candidate-env.
+--format text prints the value (or `candidate #N` for a candidate win); --format json prints
+the result object ("value": null plus "candidate", and "value_ref" for --candidate-env).
+Provenance goes to stderr.
 Exit status: 0 resolved, 1 unresolved or invalid configured value, 2 usage error
 (unknown / identity key, bad profile selection).
 """
@@ -153,16 +164,30 @@ def docker_ps(timeout: float):
     return [tuple((line.split("\t") + ["", ""])[:3]) for line in out.stdout.splitlines() if line.strip()]
 
 
-def parse_candidate(n: int, text: str, port_default):
-    """`host[:port]` -> (host, port). Candidates are host[:port] ONLY, screened with the
-    loader's host:port checks (no userinfo, credential params, `? ; & # /`, control chars).
-    Candidate text is caller-supplied and may be anything a user pasted, so it is NEVER
-    echoed: messages and results refer to it as `--candidate #n`."""
+def parse_candidate(n: int, source, port_default, environ: dict) -> dict:
+    """("value", "host[:port]") or ("env", "VAR") -> {n, host, port, env, had_port}.
+    Candidates are host[:port] ONLY, screened with the loader's host:port checks (no
+    userinfo, credential params, `? ; & # /`, control chars). Candidate text is
+    caller-supplied and may be anything a user pasted, so it is NEVER echoed: messages
+    and results refer to it by position. An env var NAME may be shown; its value never."""
+    how, text = source
     where = f"--candidate #{n}"
+    env_name = None
+    if how == "env":
+        if not isinstance(text, str) or not lp.ENV_NAME_RE.fullmatch(text):
+            raise ResolveError(f"--candidate-env #{n}: must name an env var "
+                               "([A-Z_][A-Z0-9_]*); value not shown", 2)
+        env_name, where = text, f"--candidate-env #{n} ({text})"
+        text = environ.get(env_name)
+        if text is None or not text.strip():
+            raise ResolveError(f"{where}: variable is unset or empty (export it first)", 2)
+        if text != text.strip():
+            raise ResolveError(f"{where}: value has surrounding whitespace; value not shown", 2)
     if not isinstance(text, str) or lp.has_control_chars(text):
         raise ResolveError(f"{where}: " + lp.MSG_CONTROL, 2)
     text = text.strip()
-    if re.fullmatch(r"\[[^\]]*\]|[^:\[\]]+", text):  # host without a port
+    had_port = not re.fullmatch(r"\[[^\]]*\]|[^:\[\]]+", text)  # host without a port?
+    if not had_port:
         if port_default is None:
             raise ResolveError(f"{where}: needs an explicit port (this endpoint has no "
                                "preferred port); value not shown", 2)
@@ -173,7 +198,15 @@ def parse_candidate(n: int, text: str, port_default):
         raise ResolveError(errors[0] if errors else
                            f"{where}: expected exactly one host[:port]; value not shown", 2)
     host, _, port = value.rpartition(":")
-    return host.strip("[]"), int(port)
+    return {"n": n, "host": host.strip("[]"), "port": int(port), "env": env_name, "had_port": had_port}
+
+
+def value_ref(endpoint: str, cand: dict) -> str:
+    """Shell-expandable reference to a --candidate-env win, e.g. `sc://${VAR}:15002`. Safe
+    inside double quotes: only ${VAR} expands; the scheme/port/path are fixed literals."""
+    kind, scheme, _, suffix, _ = ENDPOINTS[endpoint]
+    hp = "${" + cand["env"] + "}" + ("" if cand["had_port"] else f":{cand['port']}")
+    return hp if kind == "hostports" else f"{scheme}://{hp}{suffix}"
 
 
 def docker_candidates(rows, port, hints, container):
@@ -241,16 +274,25 @@ def resolve(endpoint: str, config_value, config_source: str, invocation, contain
 
     # 2. DISCOVER — caller-named candidates first (ordered), then docker metadata.
     probed: list[str] = []
-    for n, (host, port) in enumerate(candidates, start=1):
-        ok = probe(host, port, timeout)
-        probed.append(f"--candidate #{n} ({'reachable' if ok else 'unreachable'})")
+    for cand in candidates:
+        n = cand["n"]
+        label = f"--candidate-env #{n} ({cand['env']})" if cand["env"] else f"--candidate #{n}"
+        ok = probe(cand["host"], cand["port"], timeout)
+        probed.append(f"{label} ({'reachable' if ok else 'unreachable'})")
         if ok:
             # The caller already holds the candidate; report WHICH one, never its text.
-            notes.append(f"--candidate #{n} is reachable; its value is not repeated — use the "
-                         f"candidate you passed, and pin it with {var}")
-            return {"endpoint": endpoint, "tier": "discover", "value": None, "candidate": n,
-                    "source": f"--candidate #{n}", "reachable": True, "env_var": var,
-                    "notes": notes}
+            result = {"endpoint": endpoint, "tier": "discover", "value": None, "candidate": n,
+                      "source": label, "reachable": True, "env_var": var, "notes": notes}
+            if cand["env"]:
+                result["candidate_env"] = cand["env"]
+                result["value_ref"] = value_ref(endpoint, cand)
+                notes.append(f"{label} is reachable; --format env assigns {var} from "
+                             f"${cand['env']} (its value is never printed); pin it with {var}")
+            else:
+                notes.append(f"{label} is reachable; its value is not repeated and {var} is NOT "
+                             "set by --format env — use the candidate you passed, or pass it via "
+                             f"--candidate-env; pin it with {var}")
+            return result
     docker_note = "skipped (invocation is not docker)"
     if invocation == "docker" and pref_port is not None:
         rows = ps(timeout)
@@ -260,7 +302,9 @@ def resolve(endpoint: str, config_value, config_source: str, invocation, contain
             # Ambiguity is judged on EVERY matching published endpoint, before probing: two
             # matching services is ambiguous even if only one happens to answer right now.
             matches = docker_candidates(rows, pref_port, hints, container)
-            if len({(h, p) for h, p, _ in matches}) > 1:
+            # docker_candidates already merges duplicate mappings of ONE container (e.g. its
+            # 0.0.0.0 and :: bindings); any remaining entries are distinct publications.
+            if len(matches) > 1:
                 raise ResolveError(
                     f"could not resolve {endpoint}: docker discovery is ambiguous — "
                     f"{len(matches)} matching published endpoints "
@@ -354,8 +398,14 @@ def run(argv: list[str], environ: dict, cwd: str, home: str, probe=tcp_probe, ps
     ap.add_argument("endpoint", nargs="?", help=f"one of: {', '.join(ENDPOINTS)}")
     ap.add_argument("--file", help="profile file the user chose (*.toml or *.env)")
     ap.add_argument("--profile", help="name of the profile the user chose")
-    ap.add_argument("--candidate", action="append", default=[], metavar="HOST[:PORT]",
-                    help="specific endpoint to probe in the discover tier (repeatable, in order)")
+    ap.add_argument("--candidate", action="append", dest="cands", metavar="HOST[:PORT]",
+                    type=lambda v: ("value", v),
+                    help="endpoint to probe in the discover tier, by value (repeatable, in "
+                         "order); a win is reported by index only")
+    ap.add_argument("--candidate-env", action="append", dest="cands", metavar="VAR",
+                    type=lambda v: ("env", v),
+                    help="NAME of an exported env var holding host[:port] to probe (repeatable, "
+                         "in order); a win yields an indirect `export ...=\"...${VAR}...\"`")
     ap.add_argument("--invocation", choices=lp.INVOCATIONS,
                     help="override the effective invocation (docker enables `docker ps` discovery)")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
@@ -387,7 +437,8 @@ def run(argv: list[str], environ: dict, cwd: str, home: str, probe=tcp_probe, ps
         return fail(f"--timeout must be in (0, {MAX_TIMEOUT}]", 2)
     pref_port = ENDPOINTS[endpoint][2]
     try:
-        candidates = [parse_candidate(n, c, pref_port) for n, c in enumerate(args.candidate, start=1)]
+        candidates = [parse_candidate(n, c, pref_port, environ)
+                      for n, c in enumerate(args.cands or [], start=1)]
         value, source, invocation, container = config_lookup(args, endpoint, environ, cwd, home)
         result = resolve(endpoint, value, source, invocation, container, candidates,
                          args.timeout, probe=probe, ps=ps)
@@ -399,9 +450,13 @@ def run(argv: list[str], environ: dict, cwd: str, home: str, probe=tcp_probe, ps
     print(f"resolve_endpoint: {endpoint} <- {result['tier']} ({result['source']})", file=sys.stderr)
     if args.format == "json":
         print(json.dumps(result, indent=2, sort_keys=True))
-    elif result["value"] is None:  # a --candidate won: name its position, never its text
-        print(f"export LAKEHOUSE_RESOLVED_CANDIDATE={result['candidate']}"
-              if args.format == "env" else f"candidate #{result['candidate']}")
+    elif result["value"] is None:  # a candidate won: never print its text
+        if args.format == "text":
+            print(f"candidate #{result['candidate']}")
+        elif "value_ref" in result:  # indirect: the caller's shell expands ${VAR} at eval
+            print(f'export {result["env_var"]}="{result["value_ref"]}"')
+        else:
+            print(f"export LAKEHOUSE_RESOLVED_CANDIDATE={result['candidate']}")
     elif args.format == "env":
         print(f"export {result['env_var']}={shlex.quote(result['value'])}")
     else:
@@ -500,6 +555,19 @@ def self_test() -> int:
         expect("two matching containers, only one reachable -> still ambiguous, fails before probing",
                code == 1 and out == "" and "ambiguous" in err and probe.calls == [],
                f"{code} {out!r} {err!r} {probe.calls}")
+        same = [("spark-a", "apache/spark:4.0.1", "0.0.0.0:15012->15002/tcp"),
+                ("spark-b", "apache/spark:4.0.1", "0.0.0.0:15012->15002/tcp, :::15012->15002/tcp")]
+        probe = _probe_set(("localhost", 15012))
+        code, out, err = _call(["spark.connect_uri", "--invocation", "docker"], env, tmp, probe,
+                               lambda t: same)
+        expect("two distinct matching containers reporting the SAME host:port -> ambiguous, no probe",
+               code == 1 and "ambiguous" in err and probe.calls == [], f"{code} {err!r} {probe.calls}")
+        probe = _probe_set()
+        code, out, err = _call(["spark.connect_uri", "--invocation", "docker"], env, tmp, probe,
+                               lambda t: rows)
+        expect("single unreachable docker match: exactly one docker probe, then the preferred default",
+               code == 1 and probe.calls == [("localhost", 15012), ("localhost", 15002)]
+               and "did not answer" in err, f"{code} {err!r} {probe.calls}")
         duck = [("duckdb", "duckdb/duckdb:1.1", "0.0.0.0:18080->8080/tcp"),
                 ("lh-uc", "unitycatalog/unitycatalog:0.3", "0.0.0.0:18081->8080/tcp")]
         code, out, err = _call(["unity_catalog.rest_url", "--invocation", "docker"], env, tmp,
@@ -604,6 +672,51 @@ def self_test() -> int:
         expect("unknown --profile -> exit 2 (selection errors relayed, nothing guessed)",
                code == 2 and "no profile named" in err, f"{code} {err!r}")
 
+        # env-format contract: eval'ing the output sets the endpoint variable in every tier.
+        def eval_env(out_text, shell_env, var):
+            script = out_text + f'\nprintf "%s|%s" "${{{var}-UNSET}}" "${{LAKEHOUSE_RESOLVED_CANDIDATE-UNSET}}"'
+            r = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True,
+                               env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **shell_env})
+            return r.stdout
+        V = "LAKEHOUSE_SPARK_CONNECT_URI"
+        contract = [
+            ("config", ["spark.connect_uri"], {V: "sc://spark.internal:15010"}, _probe_set(), None,
+             V, "sc://spark.internal:15010|UNSET"),
+            ("docker discovery", ["spark.connect_uri", "--invocation", "docker"], {},
+             _probe_set(("localhost", 15012)), lambda t: rows, V, "sc://localhost:15012|UNSET"),
+            ("preferred default", ["spark.connect_uri"], {}, _probe_set(("localhost", 15002)), None,
+             V, "sc://localhost:15002|UNSET"),
+            ("--candidate-env host only", ["spark.connect_uri", "--candidate-env", "MY_SPARK"],
+             {"MY_SPARK": "spark.box"}, _probe_set(("spark.box", 15002)), None,
+             V, "sc://spark.box:15002|UNSET"),
+            ("--candidate-env host:port, after a dead by-value candidate",
+             ["spark.connect_uri", "--candidate", "dead.box", "--candidate-env", "MY_SPARK"],
+             {"MY_SPARK": "spark.box:15099"}, _probe_set(("spark.box", 15099)), None,
+             V, "sc://spark.box:15099|UNSET"),
+            ("--candidate-env http path suffix", ["unity_catalog.rest_url", "--candidate-env", "UC"],
+             {"UC": "[::1]"}, _probe_set(("::1", 8080)), None, "LAKEHOUSE_UNITY_CATALOG_REST_URL",
+             "http://[::1]:8080/api/2.1/unity-catalog|UNSET"),
+            ("--candidate-env host:port list kind", ["kafka.bootstrap_servers", "--candidate-env", "KB"],
+             {"KB": "broker.box:9093"}, _probe_set(("broker.box", 9093)), None,
+             "LAKEHOUSE_KAFKA_BOOTSTRAP_SERVERS", "broker.box:9093|UNSET"),
+            ("--candidate by value (index only, endpoint var NOT set)",
+             ["spark.connect_uri", "--candidate", "spark.box"], {}, _probe_set(("spark.box", 15002)),
+             None, V, "UNSET|1"),
+        ]
+        bad = []
+        for label, argv, extra, probe, ps_fn, var, want in contract:
+            code, out, err = _call(argv + ["--format", "env"], {**env, **extra}, tmp, probe, ps_fn)
+            shell_env = {k: v for k, v in extra.items() if not k.startswith("LAKEHOUSE_")}
+            got = eval_env(out, shell_env, var) if code == 0 else f"exit {code}: {err}"
+            if got != want:
+                bad.append((label, want, got))
+        expect(f"--format env contract: eval sets the endpoint variable for {len(contract) - 1} tier/"
+               "candidate shapes; a by-value candidate win is index-only", not bad, str(bad))
+        code, out, err = _call(["spark.connect_uri", "--candidate-env", "NOPE_UNSET"], env, tmp, nothing)
+        code2, _, err2 = _call(["spark.connect_uri", "--candidate-env", "lower;rm"], env, tmp, nothing)
+        expect("--candidate-env: unset var / invalid var name -> exit 2",
+               code == 2 and "unset" in err and code2 == 2 and "lower" not in err2, f"{err!r} {err2!r}")
+
         # no-secret-echo: every error / output path stays free of credential material.
         secrets = ["hunter2pw", "tok3nvalue", "kafkapw", "k3yvalue", "alicepw", "SUPERSECRET"]
         leaky = [
@@ -642,21 +755,35 @@ def self_test() -> int:
                not bad, str(bad)[:400])
         # Canaries in SYNTACTICALLY VALID candidates: never echoed, reachable or not.
         canaries = ["canaryhunter2pw.internal:15002", "canary-tok3nvalue"]
+        canary_env = {"CAND_A": "canaryenvsecret.internal", "CAND_B": "canary-envtok3n:15002"}
         bad = []
-        for reach in ((), (("canaryhunter2pw.internal", 15002),), (("canary-tok3nvalue", 15002),)):
+        for reach in ((), (("canaryhunter2pw.internal", 15002),), (("canary-tok3nvalue", 15002),),
+                      (("canaryenvsecret.internal", 15002),), (("canary-envtok3n", 15002),)):
             for extra_env in ({}, {"LAKEHOUSE_SPARK_CONNECT_URI": "sc://spark.internal:15002"}):
                 for inv in ([], ["--invocation", "docker"]):
                     for fmt in ("text", "json", "env"):
                         argv = ["spark.connect_uri", "--format", fmt, *inv]
                         for c in canaries:
                             argv += ["--candidate", c]
-                        code, out, err = _call(argv, {**env, **extra_env}, tmp,
+                        argv += ["--candidate-env", "CAND_A", "--candidate-env", "CAND_B"]
+                        code, out, err = _call(argv, {**env, **canary_env, **extra_env}, tmp,
                                                _probe_set(*reach), lambda t: rows2)
                         expected = 0 if (reach or extra_env) else 1
                         if code != expected or "canary" in (out + err).lower():
                             bad.append((reach, extra_env, inv, fmt, code, out + err))
-        expect("canary secrets in valid --candidate values (reachable / unreachable, success / "
-               "failure, 3 formats) never reach stdout or stderr", not bad, str(bad)[:400])
+        expect("canary secrets in valid --candidate / --candidate-env values (reachable / "
+               "unreachable, success / failure, 3 formats) never reach stdout or stderr",
+               not bad, str(bad)[:400])
+        bad = []
+        for val in ("alice:alicepw@h:15002", "h:15002;token=tok3nvalue", " hunter2pw.x ",
+                    "h\nhunter2pw", "a:1,kafkapw:2"):
+            for fmt in ("text", "json", "env"):
+                code, out, err = _call(["spark.connect_uri", "--candidate-env", "CAND", "--format", fmt],
+                                       {**env, "CAND": val}, tmp, _probe_set(("localhost", 15002)))
+                if code != 2 or "Traceback" in err or any(x in out + err for x in secrets):
+                    bad.append((val, fmt, code, out + err))
+        expect("5 credential-bearing / malformed --candidate-env values x 3 formats -> exit 2, "
+               "value never shown", not bad, str(bad)[:400])
         code, out, err = _call(["unity_catalog.rest_url"],
                                {**env, "LAKEHOUSE_UC_TOKEN": "SUPERSECRET",
                                 "LAKEHOUSE_UNITY_CATALOG_TOKEN_ENV": "LAKEHOUSE_UC_TOKEN"},

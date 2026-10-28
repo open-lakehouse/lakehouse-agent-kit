@@ -162,17 +162,27 @@ spark-sql --remote "$LAKEHOUSE_SPARK_CONNECT_URI"
 | Tier | What it does |
 |---|---|
 | 1. Config | `LAKEHOUSE_<SECTION>_<KEY>`, or the key in the profile the user selected. Authoritative — returned even if a probe fails (with a warning; do not substitute another endpoint). |
-| 2. Discover | One bounded TCP probe (default 0.5 s, `--timeout`) per specific candidate: each `--candidate HOST[:PORT]` in order (first reachable wins), then — when the effective invocation is `docker` — the port `docker ps` reports as published for the service's conventional container port (matched on the configured `container`, else whole name/image tokens). More than one matching published endpoint ⇒ ambiguous ⇒ fail, even if only one answers. |
+| 2. Discover | One bounded TCP probe (default 0.5 s, `--timeout`) per specific candidate: each `--candidate-env VAR` / `--candidate HOST[:PORT]` in command-line order (first reachable wins), then — when the effective invocation is `docker` — the port `docker ps` reports as published for the service's conventional container port (matched on the configured `container`, else whole name/image tokens). More than one matching published endpoint ⇒ ambiguous ⇒ fail, even if only one answers. |
 | 3. Preferred default | The conventional port on the local host (table below), used **only if reachable** and reported as a preference, not a certainty. |
 | 4. Fail loud | Exit `1` naming the exact env var and profile key to set. Relay it; never guess. |
 
 It never scans port ranges or arbitrary hosts. Output: the value on stdout (`--format
 text`), a JSON object with the `tier` and `source` (`--format json`), or an `export` line
-(`--format env`); provenance goes to stderr. Candidate text is never echoed: when a
-`--candidate` wins, the output names its position (`candidate #N`, `export
-LAKEHOUSE_RESOLVED_CANDIDATE=N`, or JSON `"candidate": N` with `"value": null`) — use the
-candidate you passed. Exit `0` resolved, `1` unresolved or invalid
+(`--format env`); provenance goes to stderr. Exit `0` resolved, `1` unresolved or invalid
 configured value (messages never contain the value), `2` usage error.
+
+**`--format env` is the consumable contract** — `eval` it to set the endpoint variable:
+
+| Winning tier | `--format env` output |
+|---|---|
+| config, docker discovery, preferred default | `export LAKEHOUSE_<SECTION>_<KEY>='<value>'` |
+| `--candidate-env VAR` | `export LAKEHOUSE_<SECTION>_<KEY>="<scheme>://${VAR}[:<port>][<path>]"` — indirect; your shell expands `$VAR`, the resolver never prints it |
+| `--candidate HOST[:PORT]` (by value) | `export LAKEHOUSE_RESOLVED_CANDIDATE=N` only — the endpoint variable is **not** set |
+
+Candidate text is never echoed in any format. So pass a candidate you want to *use* as the
+name of an exported variable (`export MY_SPARK=…; … --candidate-env MY_SPARK`). A by-value
+`--candidate` win only reports its position (`candidate #N` in text, `"candidate": N,
+"value": null` in JSON).
 
 ### Preferred defaults (used only after config and discovery)
 
