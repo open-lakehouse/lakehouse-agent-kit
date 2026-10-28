@@ -1,6 +1,6 @@
 ---
 name: lakehouse-core
-description: Load FIRST for any open-source lakehouse task (Apache Spark, Delta Lake, Apache Iceberg, Unity Catalog OSS, Kafka, Airflow, MLflow, Spark Declarative Pipelines, Delta Sharing, S3-compatible object stores). Parent/entry skill — resolves and validates the lakehouse connection profile (never guesses one), checks tool version floors, explains the local/docker/k8s invocation modes, and routes to the matching product skill. All endpoints come from the profile, never hardcoded hosts.
+description: Load FIRST for any open-source lakehouse task (Apache Spark, Delta Lake, Apache Iceberg, Unity Catalog OSS, Kafka, Airflow, MLflow, Spark Declarative Pipelines, Delta Sharing, S3-compatible object stores). Parent/entry skill — resolves and validates the lakehouse connection profile (never guesses one), resolves service endpoints (config → discover → preferred default → fail loud) via one shared resolver, checks tool version floors, explains the local/docker/k8s invocation modes, and routes to the matching product skill. All endpoints come from the profile, never hardcoded hosts.
 license: Apache-2.0
 compatibility: Requires python3 >= 3.8 for scripts/load_profile.py (>= 3.11 to read TOML profiles; .env profiles need no tomllib); verified on Python 3.12.3, 2026-10-21. Engine CLIs and their version floors are declared by each product skill.
 metadata:
@@ -11,16 +11,18 @@ allowed-tools: [Bash, Read]
 # Lakehouse core — connection profile, version floors, routing
 
 This is the parent skill of the Lakehouse Agent Kit. Every product skill opens with
-"FIRST: use the parent skill `lakehouse-core`". Do the three steps below **in order**
+"FIRST: use the parent skill `lakehouse-core`". Do the four steps below **in order**
 before running anything against an engine, then load the product skill from the routing
 table.
 
 1. **Select and load** the lakehouse connection profile — the user chooses; you never guess.
 2. **Validate** it for the sections the task needs.
-3. **Floor-check** the tool versions the product skill requires.
+3. **Resolve** each endpoint the task needs with the shared resolver (§4).
+4. **Floor-check** the tool versions the product skill requires.
 
-Every endpoint, container/pod name, and credential reference comes from the profile.
-Do not type a host, port, or container name into a command — read it from the profile.
+Every endpoint comes from the profile or the shared resolver; container/pod names and
+credential references come from the profile. Do not type a host, port, or container name
+into a command.
 The full field reference is `docs/connection-profile.md` in the toolkit repo; the
 contract templates are `templates/lakehouse.profile.example.toml` and
 `templates/lakehouse.profile.example.env`.
@@ -146,7 +148,53 @@ endpoint directly in every mode — the invocation mode only affects how a **CLI
 is launched. Endpoints in a profile must be reachable from wherever the command runs
 (inside a container, an in-cluster name may differ from the host-side name).
 
-## 4. Tool / version floor check
+## 4. Resolve endpoints (discover, don't hardcode; prefer, don't guess)
+
+`scripts/resolve_endpoint.py` is the **one** implementation of the resolution order.
+Product skills call it for every service endpoint they use — never re-implement
+discovery and never type a host:port:
+
+```bash
+eval "$(python3 -I scripts/resolve_endpoint.py spark.connect_uri --profile "<name-the-user-chose>" --format env)"
+spark-sql --remote "$LAKEHOUSE_SPARK_CONNECT_URI"
+```
+
+| Tier | What it does |
+|---|---|
+| 1. Config | `LAKEHOUSE_<SECTION>_<KEY>`, or the key in the profile the user selected. Authoritative — returned even if a probe fails (with a warning; do not substitute another endpoint). |
+| 2. Discover | One bounded TCP probe (default 0.5 s, `--timeout`) per specific candidate: each `--candidate HOST[:PORT]` in order (first reachable wins), then — when the effective invocation is `docker` — ports `docker ps` reports as published for the service's conventional container port. Several reachable docker matches ⇒ ambiguous ⇒ fail. |
+| 3. Preferred default | The conventional port on the local host (table below), used **only if reachable** and reported as a preference, not a certainty. |
+| 4. Fail loud | Exit `1` naming the exact env var and profile key to set. Relay it; never guess. |
+
+It never scans port ranges or arbitrary hosts. Output: the value on stdout (`--format
+text`), a JSON object with the `tier` and `source` (`--format json`), or an `export` line
+(`--format env`); provenance goes to stderr. Exit `0` resolved, `1` unresolved or invalid
+configured value (messages never contain the value), `2` usage error.
+
+### Preferred defaults (used only after config and discovery)
+
+| Endpoint (`section.key`) | Preferred port | Shape |
+|---|---|---|
+| `spark.connect_uri` | 15002 | `sc://<host>:<port>` |
+| `kafka.bootstrap_servers` | 9092 | `<host>:<port>` |
+| `unity_catalog.rest_url` / `iceberg_rest` | 8081 | `http://<host>:<port>/api/2.1/unity-catalog[/iceberg/v1]` |
+| `mlflow.tracking_uri` | 5000 | `http://<host>:<port>` |
+| `mlflow.gateway_uri` | — (config or `--candidate` only) | `http://<host>:<port>` |
+| `airflow.base_url` | 8080 | `http://<host>:<port>` |
+| `object_store.s3_endpoint` | 9000 | `http://<host>:<port>` |
+| `delta_sharing.endpoint` | 8443 | `https://<host>:<port>` |
+
+**Topology only.** The resolver answers *where a service listens*. It never selects a
+profile — with no `--profile`/`--file`/`LAKEHOUSE_PROFILE*` it reads only `LAKEHOUSE_*`
+env vars, not profile files — and it refuses identity/targeting keys (`profile.name`,
+`naming.*`, `object_store.bucket`/`warehouse`, any `*_env` credential reference) with
+exit `2`. Those are confirmed with the user (§1). A resolved endpoint is not a reason to
+pick a catalog, schema, or bucket.
+
+In a skill body, a port literal is allowed only as a labeled preferred default next to a
+call to this resolver — the linter enforces it (see `CONTRIBUTING.md`).
+
+## 5. Tool / version floor check
 
 Each product skill declares its floors in its `compatibility` field (e.g. "Requires
 spark-submit >= X.Y"). Before the first engine command in a session:
@@ -181,9 +229,9 @@ Version commands (run via `lh_exec <section> …`):
 For HTTP-only services (Unity Catalog, Delta Sharing, object store) the product skill
 documents how to read the server version from its API, if it exposes one.
 
-## 5. Route to the product skill
+## 6. Route to the product skill
 
-After §1–§4, load the product skill that matches the task. Product skills are being
+After §1–§5, load the product skill that matches the task. Product skills are being
 ported in Phase 2 of `IMPLEMENTATION_PLAN.md`; until a skill exists, say so rather than
 improvising engine-specific commands.
 
@@ -212,7 +260,9 @@ and are opt-in.
 
 - Treating the only discovered profile as "obviously the right one". It isn't — ask.
 - Copying an endpoint from a previous session, a README, or a container listing instead
-  of the profile. The profile is the single source of truth.
+  of the profile or the resolver. Config is authoritative; everything else is resolved.
+- Treating a preferred default as fact. If `resolve_endpoint.py` fails, report how to
+  set the value — do not retry with a port you remember.
 - Editing the user's profile to "fix" validation errors. Report them; the user fixes them.
 - Printing or echoing credential variables while debugging. Check `_meta.secrets` instead.
 - Using the host-side endpoint inside a container (or vice versa) — if a call from
@@ -222,4 +272,5 @@ and are opt-in.
 
 - `scripts/load_profile.py --help` for every flag; `--self-test` to check the loader.
 - `scripts/version_floor.py --self-test` to check the version comparison.
+- `scripts/resolve_endpoint.py --help`; `--self-test` to check the resolution order.
 - `docs/connection-profile.md` for the field-by-field reference.

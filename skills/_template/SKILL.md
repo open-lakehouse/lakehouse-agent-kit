@@ -36,7 +36,10 @@ key for this section (e.g. `$LAKEHOUSE_<SECTION>_<KEY>`, such as
    reachable, and treat it as a preference, not a certainty.
 4. **Fail loud** — else stop and tell the user how to set `$LAKEHOUSE_<SECTION>_<KEY>`.
 
-Call `lakehouse-core`'s resolver helpers for this; don't re-implement discovery here.
+Call `lakehouse-core`'s resolver for this — `python3 -I scripts/resolve_endpoint.py
+<section>.<key> --profile "<name-the-user-chose>" --format env` (path relative to
+`lakehouse-core`) — don't re-implement discovery here. A port literal may appear only as a
+labeled preferred default (see CONTRIBUTING.md).
 Discover *topology* this way — but never auto-pick *which* catalog/schema/bucket/creds to
 act on; confirm those.
 

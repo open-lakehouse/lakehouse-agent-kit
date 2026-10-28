@@ -83,6 +83,16 @@ Other `LAKEHOUSE_*` variables that do not map to a profile key (e.g. secret hold
 `LAKEHOUSE_UC_TOKEN`) are ignored by the loader. Inside an `.env` *file*, unrecognized
 variables produce a warning.
 
+## Unset endpoints: the resolver
+
+A missing endpoint value is not the end of the road. `skills/lakehouse-core/scripts/resolve_endpoint.py
+<section>.<key>` applies config → discover (bounded TCP probes of specific candidates,
+`docker ps` when the invocation is `docker`) → reachable preferred default → fail loud,
+and prints the env var / profile key to set when nothing resolves. It resolves topology
+only: it never selects a profile and refuses identity/targeting keys (profile name,
+catalog, schemas, bucket, warehouse, credential references). See the `lakehouse-core`
+skill for the tiers and the preferred-default ports.
+
 ## Fields
 
 `req` = required whenever the section is present. All sections except `[profile]` are
