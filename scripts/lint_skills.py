@@ -10,8 +10,13 @@ Stdlib-only; run as `python3 -I scripts/lint_skills.py`. Checks:
   compatibility <= 500 chars when present
   metadata      a mapping; `parent`, when set, names an existing skill
   size          body <= 500 lines
-  portability   no hardcoded `localhost:`, `127.0.0.1`, `sc://localhost`, literal
-                `docker exec <container-name>`, or bare `:PORT` literals
+  portability   no hardcoded `localhost:`, `127.0.0.1`, `sc://<literal-host>`, literal
+                `docker exec <container-name>`, bare `:PORT` literals, or prose port
+                assumptions (`port 9092`). A port literal is allowed only as a LABELED
+                preferred default in a skill that calls lakehouse-core's resolver
+                (`resolve_endpoint.py`): the line says "preferred default" / "prefer…" /
+                "conventional", or sits under a heading containing "preferred default".
+                Port rules skip ```output fences (example command output).
   links         every [[skill-link]] is a kebab-case slug that resolves to an existing
                 skills/<slug>/SKILL.md inside the skills directory (no placeholders)
 
@@ -49,7 +54,8 @@ MAX_DESCRIPTION = 1536
 MAX_COMPATIBILITY = 500
 MAX_NAME = 64
 MAX_BODY_LINES = 500
-PORTABILITY_RULES = ("sc-localhost", "loopback-ip", "localhost", "docker-exec", "bare-port")
+PORTABILITY_RULES = ("sc-localhost", "loopback-ip", "localhost", "sc-uri", "docker-exec",
+                     "bare-port", "port-assumption")
 ALLOW_RE = re.compile(
     r"^\s*<!--\s*lint-allow:\s*([a-z-]+(?:\s*,\s*[a-z-]+)*)\s+--\s+(.*?)\s*-->\s*$")
 MIN_JUSTIFICATION = 10
@@ -63,6 +69,10 @@ HOST_RULES = (
      "hardcoded loopback address; reference a lakehouse profile value"),
     ("localhost", re.compile(r"\blocalhost:\d*", re.I),
      "hardcoded localhost endpoint; reference a lakehouse profile value"),
+    # Any other literal Spark Connect host. Generic words (`sc://host:port`) and template
+    # placeholders (`sc://SPARK_HOST`) are illustrations, not endpoints.
+    ("sc-uri", re.compile(r"sc://(?!(?:host|hostname)\b|[A-Z][A-Z0-9_]*_HOST\b)[A-Za-z0-9][\w.-]*(?::\d+)?"),
+     "hardcoded Spark Connect host; resolve spark.connect_uri via lakehouse-core's resolver"),
 )
 DOCKER_EXEC_RE = re.compile(r"\bdocker\s+(?:container\s+)?exec\b")
 # Options of `docker exec` that consume the following token as their value.
@@ -75,6 +85,14 @@ PORT_RE = re.compile(r"(?<![\d\[:]):(\d{1,5})(?!\w)(?!\.\w)")
 PREFIX_TOKEN_RE = re.compile(r"([\w.#/-]*)$")
 FILE_REF_RE = re.compile(
     r"\.(?:py|md|sh|toml|env|json|ya?ml|txt|sql|scala|java|kt|ts|js|go|rs|cfg|ini|conf)$")
+# Prose port assumption: "port 9092", "ports 8080". Two+ digits keeps "port 1 of 3" out.
+PORT_WORD_RE = re.compile(r"\bports?\s+(?:number\s+)?(\d{2,5})\b", re.I)
+# Labels that make a port literal a stated preference rather than an assumption...
+PREFERRED_LABEL_RE = re.compile(r"\bpreferred[ -]defaults?\b|\bprefer(?:s|red|ring)?\b|\bconventional\b", re.I)
+# ...honored only when the skill routes through the shared resolver.
+RESOLVER_RE = re.compile(r"\bresolve_endpoint(?:\.py)?\b")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([\w-]*)")
 NON_PORT_LABELS = {
     "rfc", "pr", "prs", "pull", "issue", "issues", "bug", "cve", "ticket", "jira", "gh",
     "line", "lines", "step", "phase", "page", "section", "sec", "chapter", "item", "task",
@@ -141,10 +159,28 @@ class Linter:
             self.report(path, end + 2, "size",
                         f"body is {body_lines} lines (> {MAX_BODY_LINES}); move depth into references/")
 
+        has_resolver = any(RESOLVER_RE.search(t) for t in lines[end + 1:])
         allowed: set[str] = set()  # rules suppressed for the current line
+        fence = None               # (marker, info) while inside a fenced block
+        label_level = 0            # heading level of an open "preferred default" section
         for idx, text in enumerate(lines, start=1):
+            fm = FENCE_RE.match(text)
+            in_output = fence is not None and fence[1] == "output"
+            if fm and (fence is None or fm.group(1)[0] == fence[0][0]):
+                fence = (fm.group(1), fm.group(2).lower()) if fence is None else None
+                in_output = False
+            elif fence is None:
+                hm = HEADING_RE.match(text)
+                if hm:
+                    level = len(hm.group(1))
+                    if re.search(r"preferred[ -]defaults?", hm.group(2), re.I):
+                        label_level = level
+                    elif label_level and level <= label_level:
+                        label_level = 0
+            labeled = bool(label_level) or bool(PREFERRED_LABEL_RE.search(text))
             next_allowed = self.parse_allow(path, idx, text, lines)
-            self.check_portability(path, idx, text, allowed)
+            self.check_portability(path, idx, text, allowed, labeled=labeled,
+                                   has_resolver=has_resolver, in_output=in_output)
             self.check_links(path, idx, text)
             allowed = next_allowed
 
@@ -255,7 +291,9 @@ class Linter:
                         self.report(path, line, "metadata",
                                     f"metadata.parent '{parent}' is not an existing skill")
 
-    def check_portability(self, path: str, line: int, text: str, allowed: set[str]) -> None:
+    def check_portability(self, path: str, line: int, text: str, allowed: set[str],
+                          labeled: bool = False, has_resolver: bool = False,
+                          in_output: bool = False) -> None:
         taken: list[tuple[int, int]] = []
         report = self.report
 
@@ -280,14 +318,31 @@ class Linter:
                             f"literal container name in `docker exec {target}`; use the profile's "
                             "<section>.container (e.g. \"$LAKEHOUSE_SPARK_CONTAINER\")")
 
+        def port_literal(rule: str, m, msg: str) -> None:
+            """Port rules: skipped in ```output fences and for a labeled preferred default
+            in a skill that calls the resolver."""
+            if in_output or not free(m.start(), m.end()):
+                return
+            taken.append((m.start(), m.end()))
+            if labeled:
+                if has_resolver:
+                    return
+                msg += ("; it is labeled a preferred default, but this skill never calls "
+                        "lakehouse-core's resolve_endpoint.py")
+            emit(path, line, rule, msg)
+
         for m in PORT_RE.finditer(text):
             port = m.group(1)
             if not (0 < int(port) <= 65535) or self.not_a_port(text[: m.start()]):
                 continue
-            if free(m.start(), m.end()):
-                taken.append((m.start(), m.end()))
-                emit(path, line, "bare-port",
-                            f"hardcoded port ':{port}'; ports come from lakehouse profile endpoints")
+            port_literal("bare-port", m, f"hardcoded port ':{port}'; resolve the endpoint via "
+                         "lakehouse-core's resolver (profile value, else discovery, else a "
+                         "labeled preferred default)")
+
+        for m in PORT_WORD_RE.finditer(text):
+            if 0 < int(m.group(1)) <= 65535:
+                port_literal("port-assumption", m, f"port assumption {m.group(0)!r}; resolve the "
+                             "endpoint via lakehouse-core's resolver, or label it a preferred default")
 
     @staticmethod
     def not_a_port(before: str) -> bool:
@@ -364,11 +419,73 @@ localhost:7000 stays flagged because the justification above is empty.
 <!-- lint-allow: everything -- unknown rule names are rejected -->
 <!-- lint-allow: bare-port -- only the named rule is suppressed -->
 Suppressed port uc:9000 but localhost:9001 is still flagged.
+Run `spark-sql --remote sc://spark-master:15002` and point Kafka clients at port 9092.
+Prefer :15002 for Spark Connect (labeled, but this skill never calls the resolver).
 """
+
+# Uses the resolver and labels every port literal as a preferred default: must be clean.
+GOOD_RESOLVER = """---
+name: resolver-skill
+description: Load when testing the linter's preferred-default handling.
+metadata:
+  parent: other-skill
+---
+
+Resolve with `python3 -I scripts/resolve_endpoint.py spark.connect_uri` (config, then discovery).
+If nothing is configured it tries the preferred default `sc://<host>:15002`, verified reachable.
+Kafka: preferring the conventional port 9092 when nothing is configured or discovered.
+Generic shapes `sc://host:port`, `sc://SPARK_HOST`, and `<host>:<PREFERRED_PORT>` are fine.
+
+## Preferred defaults (used only after config and discovery)
+
+| Service | Shape |
+|---|---|
+| Unity Catalog REST | `http://<host>:8081/api/2.1/unity-catalog` |
+
+### MLflow
+
+- tracking `http://<host>:5000`
+
+## Example output
+
+```output
+Spark Connect server started at 0.0.0.0:15002 (port 15002)
+```
+
+Kafka 3.6.1, built 2026-10-21 at 10:30:00; see load_profile.py:42.
+"""
+
+# Calls the resolver, but assumes ports outside any preferred-default label or context.
+BAD_RESOLVER = """---
+name: assume-skill
+description: Load when testing the linter's port-assumption rules.
+---
+
+Resolve with `python3 -I scripts/resolve_endpoint.py unity_catalog.rest_url`.
+Then just connect to :15002 directly.
+
+## Preferred defaults
+
+- Spark Connect `<host>:15002`
+
+## Usage
+
+Call uc-server:8081 for REST; Kafka listens on port 9092.
+```output
+Listening on localhost:15002
+```
+```bash
+spark-sql --remote sc://spark:15002
+```
+<!-- lint-allow: port-assumption -- deliberate anti-pattern shown to readers -->
+Never write "Kafka on port 9092" in a skill.
+"""
+BAD_RESOLVER_EXPECT = {"bare-port": 2, "port-assumption": 1, "localhost": 1, "sc-uri": 1}
 
 BAD_EXPECT = {
     "name": 1, "frontmatter-key": 1, "metadata": 1, "sc-localhost": 1, "localhost": 4,
-    "loopback-ip": 1, "docker-exec": 1, "bare-port": 3, "link": 4, "lint-allow": 3,
+    "loopback-ip": 1, "docker-exec": 1, "bare-port": 4, "link": 4, "lint-allow": 3,
+    "sc-uri": 1, "port-assumption": 1,
 }
 
 
@@ -380,7 +497,8 @@ def self_test() -> int:
             fh.write(GOOD.replace("good-skill", "outside-skill"))
         tmp = os.path.join(tmp, "skills")
         for slug, text in (("good-skill", GOOD), ("other-skill", GOOD.replace("good-skill", "other-skill")),
-                           ("bad-skill", BAD)):
+                           ("bad-skill", BAD), ("resolver-skill", GOOD_RESOLVER),
+                           ("assume-skill", BAD_RESOLVER)):
             os.makedirs(os.path.join(tmp, slug))
             with open(os.path.join(tmp, slug, "SKILL.md"), "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -389,25 +507,31 @@ def self_test() -> int:
         linter = Linter(tmp)
         linter.run()
     failures = []
-    good = [v for v in linter.violations if "/good-skill/" in v or "/other-skill/" in v]
+    clean = ("/good-skill/", "/other-skill/", "/resolver-skill/")
+    good = [v for v in linter.violations if any(c in v for c in clean)]
     if good:
         failures.append("spurious flags on clean skill:\n  " + "\n  ".join(good))
     escaped = [v for v in linter.violations if "/linked-skill:0: [link]" in v]
     if len(escaped) != 1:
         failures.append(f"symlinked skill dir escaping skills/ not reported exactly once: {escaped}")
-    counts: dict[str, int] = {}
-    for v in linter.violations:
-        if "/bad-skill/" in v:
-            rule = v.split("[", 1)[1].split("]", 1)[0]
-            counts[rule] = counts.get(rule, 0) + 1
-    if counts != BAD_EXPECT:
-        failures.append(f"bad-skill rule counts {counts} != expected {BAD_EXPECT}")
+    for slug, expect in (("bad-skill", BAD_EXPECT), ("assume-skill", BAD_RESOLVER_EXPECT)):
+        counts: dict[str, int] = {}
+        for v in linter.violations:
+            if f"/{slug}/" in v:
+                rule = v.split("[", 1)[1].split("]", 1)[0]
+                counts[rule] = counts.get(rule, 0) + 1
+        if counts != expect:
+            failures.append(f"{slug} rule counts {counts} != expected {expect}")
+    unlabeled_hint = [v for v in linter.violations if "/bad-skill/" in v and "never calls" in v]
+    if len(unlabeled_hint) != 1:
+        failures.append(f"labeled-without-resolver port not reported exactly once: {unlabeled_hint}")
     for f in failures:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     if failures:
         return 1
-    print("self-test OK: clean fixture has 0 flags; bad fixture flags "
-          f"{sum(BAD_EXPECT.values())} expected violations; escaping symlink dir rejected")
+    print(f"self-test OK: {len(clean)} clean fixtures have 0 flags; bad fixtures flag "
+          f"{sum(BAD_EXPECT.values())} + {sum(BAD_RESOLVER_EXPECT.values())} expected violations; "
+          "escaping symlink dir rejected")
     return 0
 
 

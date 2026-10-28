@@ -88,10 +88,30 @@ python3 -I scripts/lint_skills.py
 
 It enforces the rules above with `file:line` messages: portable frontmatter only,
 `name` == directory, description/compatibility/body limits, no hardcoded `localhost:`,
-`127.0.0.1`, `sc://localhost`, literal `docker exec <container>`, or `:PORT` literals,
-and every `[[skill-link]]` must be a skill slug that resolves to an existing
-`skills/<slug>/` (no placeholders, no paths). Link only to skills that already exist;
-name planned ones in backticks.
+`127.0.0.1`, `sc://<literal-host>`, literal `docker exec <container>`, `:PORT` literals,
+or prose port assumptions (`port 9092`), and every `[[skill-link]]` must be a skill slug
+that resolves to an existing `skills/<slug>/` (no placeholders, no paths). Link only to
+skills that already exist; name planned ones in backticks.
+
+**Port literals as labeled preferred defaults.** Rule 2 lets a skill name a conventional
+port as a *preference*. The linter accepts a port literal (`bare-port`, `port-assumption`)
+only when both hold:
+
+- the skill body calls the shared resolver (mentions `resolve_endpoint.py`), and
+- the literal is labeled: the same line says "preferred default", "prefer…" or
+  "conventional", **or** it sits under a heading containing "Preferred default(s)" (the
+  context lasts until the next heading of the same or a higher level).
+
+```markdown
+Resolve it with `python3 -I scripts/resolve_endpoint.py spark.connect_uri`; with nothing
+configured or discovered it tries the preferred default `sc://<host>:15002`.
+```
+
+Hosts are never exempt this way — use `<host>` / placeholders. Placeholders such as
+`<host>:<PREFERRED_PORT>`, `sc://host:port`, or `sc://SPARK_HOST` are never flagged.
+Example command **output** goes in a fence tagged `output` (```` ```output ````): port rules
+skip it (version numbers, dates, times, and `file.py:42` refs are never flagged anyway),
+but host rules (`localhost:`, `127.0.0.1`, `sc://…`) still apply.
 
 To show a deliberate anti-pattern, put a standalone comment on the line **before** it,
 naming the rule(s) and why:
@@ -101,5 +121,6 @@ naming the rule(s) and why:
 ```
 
 It exempts only the next line and only the named rules (`sc-localhost`, `loopback-ip`,
-`localhost`, `docker-exec`, `bare-port`); a malformed, inline, or unjustified
+`localhost`, `sc-uri`, `docker-exec`, `bare-port`, `port-assumption`); a malformed,
+inline, or unjustified
 `lint-allow` is itself a violation.
