@@ -12,8 +12,8 @@ allowed-tools: [Bash, Read]
 # <Component> <version-range>
 
 <One paragraph grounding the skill: what engine/version this covers and how it connects —
-via the **lakehouse profile** (`$LAKEHOUSE_<X>_ENDPOINT`, etc.), NOT a hardcoded
-`localhost:PORT` or container name.>
+via the **lakehouse profile** (`$LAKEHOUSE_<SECTION>_<KEY>` values), NOT a hardcoded
+host, port, or container name.>
 
 **FIRST: use the parent skill `lakehouse-core`** to resolve the connection profile and
 verify the tool version floor before running anything here.
@@ -25,24 +25,30 @@ verify the tool version floor before running anything here.
 
 ## Resolve the environment (discover, don't hardcode; prefer, don't guess)
 
-Resolve `<ENDPOINT>` before using it — never assume a literal host/port:
+Resolve the endpoint before using it — never assume a literal host/port. Use the profile
+key for this section (e.g. `$LAKEHOUSE_<SECTION>_<KEY>`, such as
+`$LAKEHOUSE_SPARK_CONNECT_URI`):
 
-1. **Config** — use `$LAKEHOUSE_<X>_ENDPOINT` / the lakehouse profile if set.
+1. **Config** — use the `$LAKEHOUSE_<SECTION>_<KEY>` value / the lakehouse profile if set.
 2. **Discover** — else probe: ask the tool/API for its configured endpoint, test whether
-   the conventional port (<PREFERRED_PORT>) is reachable, or list running containers.
+   the conventional port (`<PREFERRED_PORT>`) is reachable, or list running containers.
 3. **Preferred default** — else fall back to `<host>:<PREFERRED_PORT>`, verify it's
    reachable, and treat it as a preference, not a certainty.
-4. **Fail loud** — else stop and tell the user how to set `LAKEHOUSE_<X>_ENDPOINT`.
+4. **Fail loud** — else stop and tell the user how to set `$LAKEHOUSE_<SECTION>_<KEY>`.
 
-Use `lakehouse-core`'s resolver helpers for this; don't re-implement discovery here.
+Call `lakehouse-core`'s resolver for this — `python3 -I scripts/resolve_endpoint.py
+<section>.<key> --profile "<name-the-user-chose>" --format env` (path relative to
+`lakehouse-core`) — don't re-implement discovery here. A port literal may appear only as a
+labeled preferred default (see CONTRIBUTING.md).
 Discover *topology* this way — but never auto-pick *which* catalog/schema/bucket/creds to
 act on; confirm those.
 
 ## <Task section>
 
 ```bash
-# <ENDPOINT> is the resolved value from the step above — not a baked-in localhost:PORT
-<cli> --endpoint "$LAKEHOUSE_<X>_ENDPOINT" ...
+# resolve first (config -> discover -> preferred default -> fail), then use the RESOLVED value
+eval "$(python3 -I <lakehouse-core>/scripts/resolve_endpoint.py <section>.<key> --profile "<name-the-user-chose>" --format env)"
+<cli> --endpoint "$LAKEHOUSE_<SECTION>_<KEY>" ...
 ```
 
 ## Common pitfalls / gotchas
@@ -51,7 +57,7 @@ act on; confirm those.
 
 ## See also
 
-- [[lakehouse-core]], [[related-skill]]
+- [[lakehouse-core]], `<related-skill>` (switch to a double-bracket link only once that skill exists)
 
 <!--
 Depth goes in references/<topic>.md and scripts/, loaded on demand. Keep this file
