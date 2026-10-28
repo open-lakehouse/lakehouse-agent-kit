@@ -43,7 +43,7 @@ act on; confirm those.
 ## <Task section>
 
 ```bash
-# endpoint is the RESOLVED value from the step above — not a baked-in localhost:PORT
+# endpoint is the RESOLVED value from the step above — not a baked-in host/port literal
 <cli> --endpoint "$LAKEHOUSE_<SECTION>_<KEY>" ...
 ```
 
