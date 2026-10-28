@@ -8,11 +8,12 @@ portability rule 2) that every product skill calls instead of hardcoding a host:
   1. CONFIG     LAKEHOUSE_<SECTION>_<KEY>, or the key in the profile the USER selected
                 (--profile/--file/LAKEHOUSE_PROFILE*). Authoritative: returned even if a
                 reachability probe fails (a warning is printed).
-  2. DISCOVER   TCP-probe specific candidates only: each --candidate the caller passes
-                (in order, first reachable wins), then — when the effective invocation is
-                `docker` — host-side ports that `docker ps` reports as published for the
-                conventional container port. Several reachable docker matches = ambiguous
-                = fail (never pick one).
+  2. DISCOVER   TCP-probe specific candidates only: each --candidate HOST[:PORT] the
+                caller passes (in order, first reachable wins; reported by position, see
+                below), then — when the effective invocation is `docker` — the host-side
+                port `docker ps` reports as published for the conventional container port.
+                More than one matching published endpoint = ambiguous = fail, judged
+                BEFORE probing (never pick the one that happens to answer).
   3. PREFERRED  the conventional port on localhost (registry below), returned ONLY if
                 reachable, and labeled a preference, not a certainty.
   4. FAIL LOUD  exit 1 naming the env var / profile key to set. Never silently assume.
@@ -26,11 +27,14 @@ read) and refuses identity/targeting keys (profile name, catalog, schema, bucket
 warehouse, credentials) — those are confirmed with the user (load_profile.py).
 
 No-secret-echo: configured values are validated with load_profile.check_value (userinfo
-and credential parameters are rejected with value-free messages); only validated values,
-validated hosts, and integer ports ever reach stdout/stderr.
+and credential parameters are rejected with value-free messages); only validated config
+values, docker-derived hosts, and integer ports ever reach stdout/stderr. --candidate
+text is never echoed anywhere: a winning candidate is reported as `candidate #N`.
 
 Output: the resolved value on stdout (--format text, default), a JSON object
-(--format json), or one `export` line (--format env); provenance goes to stderr.
+(--format json), or one `export` line (--format env); provenance goes to stderr. When a
+--candidate wins, the value is withheld (the caller holds it): text prints `candidate #N`,
+env prints `export LAKEHOUSE_RESOLVED_CANDIDATE=N`, JSON has "candidate": N, "value": null.
 Exit status: 0 resolved, 1 unresolved or invalid configured value, 2 usage error
 (unknown / identity key, bad profile selection).
 """
@@ -70,18 +74,22 @@ DEFAULT_TIMEOUT = 0.5   # seconds per TCP probe
 MAX_TIMEOUT = 5.0
 
 # Endpoint registry: section.key -> (kind, scheme, preferred port or None, path suffix,
-# docker name/image hints). Preferred ports are the services' conventional ports — a
-# PREFERENCE tried after config and discovery, never an assumption.
+# docker name/image tokens). Preferred ports are the services' generic UPSTREAM conventional
+# ports — a PREFERENCE tried after config and discovery, never an assumption. They must
+# agree with templates/lakehouse.profile.example.* (checked by --self-test). A deployment
+# that remaps a port (e.g. UC moved off 8080 to avoid Airflow) says so in its own profile,
+# never here. Unity Catalog OSS: UnityCatalogServer.DEFAULT_PORT = 8080 upstream.
 ENDPOINTS = {
     "spark.connect_uri":          ("sc_uri", "sc", 15002, "", ("spark",)),
     "kafka.bootstrap_servers":    ("hostports", "", 9092, "", ("kafka", "redpanda")),
-    "unity_catalog.rest_url":     ("http_url", "http", 8081, "/api/2.1/unity-catalog", ("unity", "uc")),
-    "unity_catalog.iceberg_rest": ("http_url", "http", 8081, "/api/2.1/unity-catalog/iceberg/v1",
-                                   ("unity", "uc")),
+    "unity_catalog.rest_url":     ("http_url", "http", 8080, "/api/2.1/unity-catalog",
+                                   ("unitycatalog", "unity", "uc")),
+    "unity_catalog.iceberg_rest": ("http_url", "http", 8080, "/api/2.1/unity-catalog/iceberg/v1",
+                                   ("unitycatalog", "unity", "uc")),
     "mlflow.tracking_uri":        ("http_url", "http", 5000, "", ("mlflow",)),
     "mlflow.gateway_uri":         ("http_url", "http", None, "", ("mlflow",)),
     "airflow.base_url":           ("http_url", "http", 8080, "", ("airflow",)),
-    "object_store.s3_endpoint":   ("http_url", "http", 9000, "", ("minio", "seaweed", "s3")),
+    "object_store.s3_endpoint":   ("http_url", "http", 9000, "", ("minio", "seaweedfs", "seaweed", "s3")),
     "delta_sharing.endpoint":     ("http_url", "https", 8443, "", ("sharing",)),
 }
 # Identity / targeting: which profile, catalog, schema, bucket, or credentials to act on.
@@ -89,6 +97,7 @@ ENDPOINTS = {
 IDENTITY_KEYS = {"profile.name", "naming.default_catalog", "naming.schemas",
                  "object_store.bucket", "object_store.warehouse", "object_store.region",
                  "k8s.namespace", "k8s.context"}
+NAME_TOKEN_RE = re.compile(r"[a-z0-9]+")
 DOCKER_PORT_RE = re.compile(r"^(?P<ip>[0-9.]+|\[?[0-9a-fA-F:]*\]?):(?P<host>\d{1,5})->(?P<ctr>\d{1,5})/tcp$")
 
 
@@ -144,19 +153,27 @@ def docker_ps(timeout: float):
     return [tuple((line.split("\t") + ["", ""])[:3]) for line in out.stdout.splitlines() if line.strip()]
 
 
-def parse_candidate(text: str, port_default):
-    """`host[:port]` -> (host, port), validated; raises ResolveError without echoing."""
-    if not isinstance(text, str) or lp.has_control_chars(text) or "@" in text \
-            or lp.HOSTPORT_FORBIDDEN & set(text):
-        raise ResolveError("--candidate: invalid host[:port] (value not shown)", 2)
-    m = re.fullmatch(r"(\[[^\]]+\]|[^:]+)(?::(\d{1,5}))?", text.strip())
-    if not m or not lp.valid_host(m.group(1)):
-        raise ResolveError("--candidate: invalid host[:port] (value not shown)", 2)
-    port = int(m.group(2)) if m.group(2) else port_default
-    if port is None or not 1 <= port <= 65535:
-        raise ResolveError("--candidate: needs a port 1-65535 (this endpoint has no preferred "
-                           "port); value not shown", 2)
-    return m.group(1).strip("[]"), port
+def parse_candidate(n: int, text: str, port_default):
+    """`host[:port]` -> (host, port). Candidates are host[:port] ONLY, screened with the
+    loader's host:port checks (no userinfo, credential params, `? ; & # /`, control chars).
+    Candidate text is caller-supplied and may be anything a user pasted, so it is NEVER
+    echoed: messages and results refer to it as `--candidate #n`."""
+    where = f"--candidate #{n}"
+    if not isinstance(text, str) or lp.has_control_chars(text):
+        raise ResolveError(f"{where}: " + lp.MSG_CONTROL, 2)
+    text = text.strip()
+    if re.fullmatch(r"\[[^\]]*\]|[^:\[\]]+", text):  # host without a port
+        if port_default is None:
+            raise ResolveError(f"{where}: needs an explicit port (this endpoint has no "
+                               "preferred port); value not shown", 2)
+        text = f"{text}:{port_default}"
+    errors: list[str] = []
+    value = lp.check_value(where, "hostports", text, errors)
+    if errors or not value or "," in value:
+        raise ResolveError(errors[0] if errors else
+                           f"{where}: expected exactly one host[:port]; value not shown", 2)
+    host, _, port = value.rpartition(":")
+    return host.strip("[]"), int(port)
 
 
 def docker_candidates(rows, port, hints, container):
@@ -167,8 +184,8 @@ def docker_candidates(rows, port, hints, container):
         if container:
             if name != container:
                 continue
-        elif not any(h in (name + " " + image).lower() for h in hints):
-            continue
+        elif not set(hints) & set(NAME_TOKEN_RE.findall((name + " " + image).lower())):
+            continue  # token match: "uc" matches "lh-uc" but not "duckdb"
         for spec in ports.split(","):
             m = DOCKER_PORT_RE.match(spec.strip())
             if not m or int(m.group("ctr")) != port:
@@ -211,7 +228,8 @@ def resolve(endpoint: str, config_value, config_source: str, invocation, contain
                        for h in value.split(",")]
         else:
             u = urlparse(value)
-            default = pref_port or (443 if u.scheme == "https" else 80)
+            # No explicit port: the scheme's own default (sc:// is Spark Connect's 15002).
+            default = {"https": 443, "http": 80, "sc": 15002}[u.scheme]
             targets = [(lp.netloc_host(u.netloc).strip("[]"), u.port or default)]
         reachable = any(probe(h, p, timeout) for h, p in targets)
         if not reachable:
@@ -223,37 +241,44 @@ def resolve(endpoint: str, config_value, config_source: str, invocation, contain
 
     # 2. DISCOVER — caller-named candidates first (ordered), then docker metadata.
     probed: list[str] = []
-    for host, port in candidates:
+    for n, (host, port) in enumerate(candidates, start=1):
         ok = probe(host, port, timeout)
-        probed.append(f"{fmt_hp(host, port)} ({'reachable' if ok else 'unreachable'})")
+        probed.append(f"--candidate #{n} ({'reachable' if ok else 'unreachable'})")
         if ok:
-            return {"endpoint": endpoint, "tier": "discover", "value": build_value(endpoint, host, port),
-                    "source": "--candidate", "reachable": True, "env_var": var, "notes": notes}
+            # The caller already holds the candidate; report WHICH one, never its text.
+            notes.append(f"--candidate #{n} is reachable; its value is not repeated — use the "
+                         f"candidate you passed, and pin it with {var}")
+            return {"endpoint": endpoint, "tier": "discover", "value": None, "candidate": n,
+                    "source": f"--candidate #{n}", "reachable": True, "env_var": var,
+                    "notes": notes}
     docker_note = "skipped (invocation is not docker)"
     if invocation == "docker" and pref_port is not None:
         rows = ps(timeout)
         if rows is None:
             docker_note = "skipped (docker CLI unavailable or `docker ps` failed)"
         else:
-            hits = []
-            for host, port, name in docker_candidates(rows, pref_port, hints, container):
+            # Ambiguity is judged on EVERY matching published endpoint, before probing: two
+            # matching services is ambiguous even if only one happens to answer right now.
+            matches = docker_candidates(rows, pref_port, hints, container)
+            if len({(h, p) for h, p, _ in matches}) > 1:
+                raise ResolveError(
+                    f"could not resolve {endpoint}: docker discovery is ambiguous — "
+                    f"{len(matches)} matching published endpoints "
+                    f"({', '.join(f'{fmt_hp(h, p)} from {name}' for h, p, name in matches)}); "
+                    f"refusing to pick one.\nAsk the user which one, then: {env_hint(endpoint)}", 1)
+            if matches:
+                host, port, name = matches[0]
                 ok = probe(host, port, timeout)
                 probed.append(f"{fmt_hp(host, port)} from container {name} "
                               f"({'reachable' if ok else 'unreachable'})")
-                if ok and (host, port) not in [(h, p) for h, p, _ in hits]:
-                    hits.append((host, port, name))
-            if len(hits) == 1:
-                host, port, name = hits[0]
-                return {"endpoint": endpoint, "tier": "discover",
-                        "value": build_value(endpoint, host, port),
-                        "source": f"docker ps (container {name} publishes {pref_port})",
-                        "reachable": True, "env_var": var, "notes": notes}
-            if len(hits) > 1:
-                raise ResolveError(
-                    f"could not resolve {endpoint}: discovery is ambiguous — several reachable "
-                    f"candidates ({', '.join(fmt_hp(h, p) for h, p, _ in hits)}); refusing to pick one.\n"
-                    f"Ask the user which one, then: {env_hint(endpoint)}", 1)
-            docker_note = "no running container publishes the conventional port"
+                if ok:
+                    return {"endpoint": endpoint, "tier": "discover",
+                            "value": build_value(endpoint, host, port),
+                            "source": f"docker ps (container {name} publishes {pref_port})",
+                            "reachable": True, "env_var": var, "notes": notes}
+                docker_note = "the one matching container did not answer"
+            else:
+                docker_note = "no running container publishes the conventional port"
 
     # 3. PREFERRED DEFAULT — only if reachable; labeled a preference.
     if pref_port is not None:
@@ -362,7 +387,7 @@ def run(argv: list[str], environ: dict, cwd: str, home: str, probe=tcp_probe, ps
         return fail(f"--timeout must be in (0, {MAX_TIMEOUT}]", 2)
     pref_port = ENDPOINTS[endpoint][2]
     try:
-        candidates = [parse_candidate(c, pref_port) for c in args.candidate]
+        candidates = [parse_candidate(n, c, pref_port) for n, c in enumerate(args.candidate, start=1)]
         value, source, invocation, container = config_lookup(args, endpoint, environ, cwd, home)
         result = resolve(endpoint, value, source, invocation, container, candidates,
                          args.timeout, probe=probe, ps=ps)
@@ -374,6 +399,9 @@ def run(argv: list[str], environ: dict, cwd: str, home: str, probe=tcp_probe, ps
     print(f"resolve_endpoint: {endpoint} <- {result['tier']} ({result['source']})", file=sys.stderr)
     if args.format == "json":
         print(json.dumps(result, indent=2, sort_keys=True))
+    elif result["value"] is None:  # a --candidate won: name its position, never its text
+        print(f"export LAKEHOUSE_RESOLVED_CANDIDATE={result['candidate']}"
+              if args.format == "env" else f"candidate #{result['candidate']}")
     elif args.format == "env":
         print(f"export {result['env_var']}={shlex.quote(result['value'])}")
     else:
@@ -449,8 +477,8 @@ def self_test() -> int:
         probe = _probe_set(("b.internal", 15002), ("c.internal", 15003), ("localhost", 15002))
         code, out, err = _call(["spark.connect_uri", "--candidate", "a.internal", "--candidate",
                                 "b.internal", "--candidate", "c.internal:15003"], env, tmp, probe)
-        expect("discovery picks the first reachable candidate (before the preferred default)",
-               code == 0 and out.strip() == "sc://b.internal:15002" and "<- discover" in err
+        expect("discovery picks the first reachable candidate (before the preferred default), by position",
+               code == 0 and out.strip() == "candidate #2" and "<- discover" in err
                and probe.calls == [("a.internal", 15002), ("b.internal", 15002)],
                f"{code} {out!r} {err!r} {probe.calls}")
         rows = [("lh-spark-1", "apache/spark:4.0.1", "0.0.0.0:15012->15002/tcp, :::15012->15002/tcp"),
@@ -463,8 +491,21 @@ def self_test() -> int:
         rows2 = rows + [("spark-b", "apache/spark:4.0.1", "127.0.0.1:15013->15002/tcp")]
         code, out, err = _call(["spark.connect_uri", "--invocation", "docker"], env, tmp,
                                _probe_set(("localhost", 15012), ("127.0.0.1", 15013)), lambda t: rows2)
-        expect("ambiguous docker discovery fails loud instead of picking one",
+        expect("ambiguous docker discovery (both reachable) fails loud instead of picking one",
                code == 1 and out == "" and "ambiguous" in err and "LAKEHOUSE_SPARK_CONNECT_URI" in err,
+               f"{code} {out!r} {err!r}")
+        probe = _probe_set(("127.0.0.1", 15013), ("localhost", 15002))
+        code, out, err = _call(["spark.connect_uri", "--invocation", "docker"], env, tmp, probe,
+                               lambda t: rows2)
+        expect("two matching containers, only one reachable -> still ambiguous, fails before probing",
+               code == 1 and out == "" and "ambiguous" in err and probe.calls == [],
+               f"{code} {out!r} {err!r} {probe.calls}")
+        duck = [("duckdb", "duckdb/duckdb:1.1", "0.0.0.0:18080->8080/tcp"),
+                ("lh-uc", "unitycatalog/unitycatalog:0.3", "0.0.0.0:18081->8080/tcp")]
+        code, out, err = _call(["unity_catalog.rest_url", "--invocation", "docker"], env, tmp,
+                               _probe_set(("localhost", 18081)), lambda t: duck)
+        expect("docker hints match whole name/image tokens ('uc' does not match 'duckdb')",
+               code == 0 and out.strip() == "http://localhost:18081/api/2.1/unity-catalog",
                f"{code} {out!r} {err!r}")
         code, out, err = _call(["spark.connect_uri"], env, tmp,
                                _probe_set(("localhost", 15012)), lambda t: rows)
@@ -486,19 +527,45 @@ def self_test() -> int:
                                     "--format", "json"], env, tmp, ps=no_docker)
             res = json.loads(out) if code == 0 else {}
             expect("real TCP probe: unreachable candidate skipped, live one chosen (json output)",
-                   res.get("value") == f"http://127.0.0.1:{live}" and res.get("tier") == "discover",
+                   res.get("candidate") == 2 and res.get("value") is None
+                   and res.get("tier") == "discover" and str(live) not in out + err,
                    f"{code} {out!r} {err!r}")
         finally:
             srv.close()
 
         # preferred-default-when-unset-but-reachable.
         code, out, err = _call(["unity_catalog.rest_url", "--format", "env"], env, tmp,
-                               _probe_set(("localhost", 8081)))
+                               _probe_set(("localhost", 8080)))
         expect("preferred default used when unset but reachable, labeled a preference",
                code == 0 and out.strip() == "export LAKEHOUSE_UNITY_CATALOG_REST_URL="
-               "http://localhost:8081/api/2.1/unity-catalog"
+               "http://localhost:8080/api/2.1/unity-catalog"
                and "preferred_default" in err and "a preference, not a certainty" in err,
                f"{code} {out!r} {err!r}")
+
+        probe = _probe_set(("mlflow.internal", 443))
+        code, out, err = _call(["mlflow.tracking_uri"],
+                               {**env, "LAKEHOUSE_MLFLOW_TRACKING_URI": "https://mlflow.internal"}, tmp, probe)
+        expect("configured URL without a port probes its scheme default (https -> 443), no warning",
+               code == 0 and probe.calls == [("mlflow.internal", 443)] and "authoritative" not in err,
+               f"{code} {err!r} {probe.calls}")
+
+        # Exactly one generic default per endpoint: the shipped template must agree.
+        tmpl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                            "templates", "lakehouse.profile.example.toml")
+        if os.path.isfile(tmpl) and lp.tomllib is not None:
+            data, mismatch = lp.read_toml(tmpl), []
+            for ep, (kind, _, port, _, _) in ENDPOINTS.items():
+                sec, key = ep.split(".", 1)
+                val = (data.get(sec) or {}).get(key)
+                if not val or port is None:  # no generic default to disagree with
+                    continue
+                got = int(val.rsplit(":", 1)[1]) if kind == "hostports" else urlparse(val).port
+                if got != port:
+                    mismatch.append((ep, got, port))
+            expect("preferred ports agree with templates/lakehouse.profile.example.toml "
+                   "(one authoritative generic default)", not mismatch, str(mismatch))
+        else:
+            print("  skip template port parity (templates/ not found next to this skill)")
 
         # fail-loud-when-unreachable.
         for ep in ENDPOINTS:
@@ -562,12 +629,38 @@ def self_test() -> int:
                                        _probe_set(("localhost", 15002)))
                 if code == 0 or "Traceback" in err or any(s in out + err for s in secrets):
                     bad.append((ep, fmt, code, out + err))
-        expect(f"{len(leaky)} credential-bearing config/candidate values x 3 formats rejected "
-               "(exit != 0), no traceback, no secret in stdout/stderr", not bad, str(bad)[:400])
+        leaky_cands = [["h:15002;token=tok3nvalue"], ["h:15002&k3yvalue"], ["h#hunter2pw:15002"],
+                       ["k1:9092,kafkapw:9092"], ["[kafkapw]:15002"]]
+        for cands in leaky_cands:
+            argv = ["spark.connect_uri"] + [a for c in cands for a in ("--candidate", c)]
+            for fmt in ("text", "json", "env"):
+                code, out, err = _call(argv + ["--format", fmt], env, tmp, _probe_set(("localhost", 15002)))
+                if code != 2 or "Traceback" in err or any(s in out + err for s in secrets):
+                    bad.append((cands, fmt, code, out + err))
+        expect(f"{len(leaky) + len(leaky_cands)} credential-bearing / malformed config & candidate "
+               "values x 3 formats rejected, no traceback, no secret in stdout/stderr",
+               not bad, str(bad)[:400])
+        # Canaries in SYNTACTICALLY VALID candidates: never echoed, reachable or not.
+        canaries = ["canaryhunter2pw.internal:15002", "canary-tok3nvalue"]
+        bad = []
+        for reach in ((), (("canaryhunter2pw.internal", 15002),), (("canary-tok3nvalue", 15002),)):
+            for extra_env in ({}, {"LAKEHOUSE_SPARK_CONNECT_URI": "sc://spark.internal:15002"}):
+                for inv in ([], ["--invocation", "docker"]):
+                    for fmt in ("text", "json", "env"):
+                        argv = ["spark.connect_uri", "--format", fmt, *inv]
+                        for c in canaries:
+                            argv += ["--candidate", c]
+                        code, out, err = _call(argv, {**env, **extra_env}, tmp,
+                                               _probe_set(*reach), lambda t: rows2)
+                        expected = 0 if (reach or extra_env) else 1
+                        if code != expected or "canary" in (out + err).lower():
+                            bad.append((reach, extra_env, inv, fmt, code, out + err))
+        expect("canary secrets in valid --candidate values (reachable / unreachable, success / "
+               "failure, 3 formats) never reach stdout or stderr", not bad, str(bad)[:400])
         code, out, err = _call(["unity_catalog.rest_url"],
                                {**env, "LAKEHOUSE_UC_TOKEN": "SUPERSECRET",
                                 "LAKEHOUSE_UNITY_CATALOG_TOKEN_ENV": "LAKEHOUSE_UC_TOKEN"},
-                               tmp, _probe_set(("localhost", 8081)))
+                               tmp, _probe_set(("localhost", 8080)))
         expect("successful resolution never prints referenced credential values",
                code == 0 and "SUPERSECRET" not in out + err, f"{code} {out!r} {err!r}")
         with open(os.path.join(tmp, "leak.profile.toml"), "w", encoding="utf-8") as fh:

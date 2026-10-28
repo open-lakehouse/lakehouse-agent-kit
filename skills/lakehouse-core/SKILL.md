@@ -162,13 +162,16 @@ spark-sql --remote "$LAKEHOUSE_SPARK_CONNECT_URI"
 | Tier | What it does |
 |---|---|
 | 1. Config | `LAKEHOUSE_<SECTION>_<KEY>`, or the key in the profile the user selected. Authoritative — returned even if a probe fails (with a warning; do not substitute another endpoint). |
-| 2. Discover | One bounded TCP probe (default 0.5 s, `--timeout`) per specific candidate: each `--candidate HOST[:PORT]` in order (first reachable wins), then — when the effective invocation is `docker` — ports `docker ps` reports as published for the service's conventional container port. Several reachable docker matches ⇒ ambiguous ⇒ fail. |
+| 2. Discover | One bounded TCP probe (default 0.5 s, `--timeout`) per specific candidate: each `--candidate HOST[:PORT]` in order (first reachable wins), then — when the effective invocation is `docker` — the port `docker ps` reports as published for the service's conventional container port (matched on the configured `container`, else whole name/image tokens). More than one matching published endpoint ⇒ ambiguous ⇒ fail, even if only one answers. |
 | 3. Preferred default | The conventional port on the local host (table below), used **only if reachable** and reported as a preference, not a certainty. |
 | 4. Fail loud | Exit `1` naming the exact env var and profile key to set. Relay it; never guess. |
 
 It never scans port ranges or arbitrary hosts. Output: the value on stdout (`--format
 text`), a JSON object with the `tier` and `source` (`--format json`), or an `export` line
-(`--format env`); provenance goes to stderr. Exit `0` resolved, `1` unresolved or invalid
+(`--format env`); provenance goes to stderr. Candidate text is never echoed: when a
+`--candidate` wins, the output names its position (`candidate #N`, `export
+LAKEHOUSE_RESOLVED_CANDIDATE=N`, or JSON `"candidate": N` with `"value": null`) — use the
+candidate you passed. Exit `0` resolved, `1` unresolved or invalid
 configured value (messages never contain the value), `2` usage error.
 
 ### Preferred defaults (used only after config and discovery)
@@ -177,12 +180,17 @@ configured value (messages never contain the value), `2` usage error.
 |---|---|---|
 | `spark.connect_uri` | 15002 | `sc://<host>:<port>` |
 | `kafka.bootstrap_servers` | 9092 | `<host>:<port>` |
-| `unity_catalog.rest_url` / `iceberg_rest` | 8081 | `http://<host>:<port>/api/2.1/unity-catalog[/iceberg/v1]` |
+| `unity_catalog.rest_url` / `iceberg_rest` | 8080 (upstream UC OSS default) | `http://<host>:<port>/api/2.1/unity-catalog[/iceberg/v1]` |
 | `mlflow.tracking_uri` | 5000 | `http://<host>:<port>` |
 | `mlflow.gateway_uri` | — (config or `--candidate` only) | `http://<host>:<port>` |
 | `airflow.base_url` | 8080 | `http://<host>:<port>` |
-| `object_store.s3_endpoint` | 9000 | `http://<host>:<port>` |
+| `object_store.s3_endpoint` | 9000 (MinIO / common S3-compatible; SeaweedFS's 8333 belongs in that deployment's profile) | `http://<host>:<port>` |
 | `delta_sharing.endpoint` | 8443 | `https://<host>:<port>` |
+
+These are generic upstream conventions and match `templates/lakehouse.profile.example.*`
+(the resolver self-test checks this). A deployment that remaps a port — e.g. UC on 8081 to
+avoid Airflow's 8080 — records it in its own profile, never here. Note UC and Airflow
+share 8080: a reachable preferred default proves only that *something* listens there.
 
 **Topology only.** The resolver answers *where a service listens*. It never selects a
 profile — with no `--profile`/`--file`/`LAKEHOUSE_PROFILE*` it reads only `LAKEHOUSE_*`

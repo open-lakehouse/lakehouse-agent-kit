@@ -49,7 +49,7 @@ pod                = ""
 
 [object_store]
 kind           = "s3"                    # required; s3-compatible (SeaweedFS, MinIO, AWS S3, …)
-s3_endpoint    = "http://OBJECT_STORE_HOST:8333"   # required
+s3_endpoint    = "http://OBJECT_STORE_HOST:9000"   # required
 bucket         = "lakehouse"             # required
 warehouse      = "s3://lakehouse/warehouse"        # required; s3:// or s3a:// URI
 region         = ""                      # optional; e.g. "us-east-1"
