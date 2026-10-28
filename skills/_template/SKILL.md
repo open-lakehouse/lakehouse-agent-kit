@@ -23,10 +23,27 @@ verify the tool version floor before running anything here.
 - <intent 1>
 - <intent 2>
 
+## Resolve the environment (discover, don't hardcode; prefer, don't guess)
+
+Resolve the endpoint before using it — never assume a literal host/port. Use the profile
+key for this section (e.g. `$LAKEHOUSE_<SECTION>_<KEY>`, such as
+`$LAKEHOUSE_SPARK_CONNECT_URI`):
+
+1. **Config** — use the `$LAKEHOUSE_<SECTION>_<KEY>` value / the lakehouse profile if set.
+2. **Discover** — else probe: ask the tool/API for its configured endpoint, test whether
+   the conventional port (`<PREFERRED_PORT>`) is reachable, or list running containers.
+3. **Preferred default** — else fall back to `<host>:<PREFERRED_PORT>`, verify it's
+   reachable, and treat it as a preference, not a certainty.
+4. **Fail loud** — else stop and tell the user how to set `$LAKEHOUSE_<SECTION>_<KEY>`.
+
+Call `lakehouse-core`'s resolver helpers for this; don't re-implement discovery here.
+Discover *topology* this way — but never auto-pick *which* catalog/schema/bucket/creds to
+act on; confirm those.
+
 ## <Task section>
 
 ```bash
-# profile-driven invocation — not a single deployment's exact command
+# endpoint is the RESOLVED value from the step above — not a baked-in localhost:PORT
 <cli> --endpoint "$LAKEHOUSE_<SECTION>_<KEY>" ...
 ```
 

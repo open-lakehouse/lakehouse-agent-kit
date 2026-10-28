@@ -37,10 +37,33 @@ error on other platforms.
 1. **No hardcoded endpoints.** Never write `localhost:8081`, `sc://localhost:15002`, a
    container name, or a repo-relative path in a skill body. Reference **lakehouse
    profile** values and documented placeholders instead.
-2. **No secrets inline.** Reference credentials by env-var name.
-3. **Invocation modes are explicit.** If a step runs a CLI, show the profile-driven form
-   (local binary / `docker exec` / k8s), not one deployment's exact command.
-4. **Deployment-specific content** (a specific compose stack, proxy, or app) goes under
+2. **Discover, don't hardcode; prefer, don't guess.** When a source skill says "use X on
+   port N", do **not** copy that literal. Instruct the agent to resolve the value in this
+   order, and call the shared `lakehouse-core` resolver helpers rather than re-rolling it:
+   1. **Config** — a profile/env value, if set, wins.
+   2. **Discover** — else probe the live environment (ask the tool/API for its endpoint,
+      test reachability of the conventional port, list running containers, read a
+      well-known config). Teach the *discovery command*, not the answer.
+   3. **Preferred default** — else fall back to the conventional value, verify it's
+      reachable, and label it a preference.
+   4. **Fail loud** — else stop and say how to set it. Never silently assume.
+
+   Resolve *topology* this way (where a service lives, which port it's on). Do **not**
+   auto-resolve *identity/targeting with side effects* — which profile, catalog, schema,
+   bucket, or credentials to act on is confirmed with the user, never guessed.
+
+   ```md
+   ❌ Run `spark-sql --remote sc://localhost:15002`                 # baked-in assumption
+   ✅ Resolve the Spark Connect endpoint: use `$LAKEHOUSE_SPARK_CONNECT_URI` / the profile
+      if set; else check whether a Spark Connect server is reachable (preferring the
+      conventional port 15002) and use that; else report that no endpoint was found and
+      how to set one. Then: `spark-sql --remote "$LAKEHOUSE_SPARK_CONNECT_URI"`
+   ```
+3. **No secrets inline.** Reference credentials by env-var name.
+4. **Invocation modes are explicit.** If a step runs a CLI, show the profile-driven form
+   (local binary / `docker exec` / k8s), not one deployment's exact command — resolved via
+   the same order as rule 2.
+5. **Deployment-specific content** (a specific compose stack, proxy, or app) goes under
    `reference-stack/`, not in a portable engine skill.
 
 ## Honesty & provenance
