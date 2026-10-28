@@ -1,6 +1,5 @@
 <div align="center">
 
-![Lakehouse Agent Kit — by Open Lakehouse + AI](docs/assets/banner.png)
 
 # 🏞️ Lakehouse Agent Kit
 
@@ -8,9 +7,9 @@
 
 **Cross-agent [Agent Skills](https://agentskills.io) for Apache Spark · Delta Lake · Apache Iceberg · Unity Catalog (OSS) · Kafka · Airflow · MLflow · Delta Sharing.**
 
-The open-source cousin of the Databricks agent toolkit — but for *your* stack, wherever it runs.
-
 <sub>🧪 **Status: v0.1 — foundations landed & cross-reviewed, engine skills in flight.** Apache-2.0.</sub>
+
+![Lakehouse Agent Kit — by Open Lakehouse + AI](docs/assets/banner.png)
 
 </div>
 
