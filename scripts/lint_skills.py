@@ -15,8 +15,9 @@ Stdlib-only; run as `python3 -I scripts/lint_skills.py`. Checks:
                 assumptions (`port 9092`). A port literal is allowed only as a LABELED
                 preferred default in a skill that INVOKES lakehouse-core's resolver
                 (inside a non-`output`/`text` code fence, `python3 … resolve_endpoint.py
-                <section>.<key>` in command position — not echoed, quoted, or commented;
-                `$(...)` substitutions count): the line says "preferred default" / "prefer…" /
+                <section>.<key>` in command position — not echoed, quoted, commented, or
+                inside a heredoc / multi-line literal; `$(...)` substitutions count): the
+                line says "preferred default" / "prefer…" /
                 "conventional", or sits under a heading containing "preferred default".
                 Fences get no blanket exemption — not even ```output.
   links         every [[skill-link]] is a kebab-case slug that resolves to an existing
@@ -173,17 +174,7 @@ class Linter:
                         f"body is {body_lines} lines (> {MAX_BODY_LINES}); move depth into references/")
 
         fences = self.fence_info(lines, end + 1)
-        has_resolver, logical = False, ""
-        for i in range(end + 1, len(lines)):  # join `\`-continued lines within a fence
-            if fences[i][0] is None or fences[i][1]:
-                logical = ""
-                continue
-            logical += lines[i]
-            if logical.endswith("\\"):
-                logical = logical[:-1] + " "
-                continue
-            has_resolver = has_resolver or self.invokes_resolver(logical, fences[i])
-            logical = ""
+        has_resolver = bool(self.resolver_lines(lines, fences, end + 1))
         allowed: set[str] = set()        # rules suppressed for the current line
         fence_allowed: set[str] = set()  # rules suppressed for the whole current fence
         label_level = 0                  # heading level of an open "preferred default" section
@@ -236,6 +227,38 @@ class Linter:
             return False
         line = re.sub(r"^\s*\$\s+", "", text)  # console prompt `$ cmd`
         return any(is_resolver_command(cmd) for cmd in shell_commands(line))
+
+    @classmethod
+    def resolver_lines(cls, lines: list[str], fences: list, start: int = 0) -> list[int]:
+        """Indices of lines that really invoke the resolver. Shell state is carried across
+        each fenced block (ShellState): a logical line (backslash-continued lines joined)
+        counts only if it STARTS and ENDS in a clean state — not inside a heredoc body, a
+        multi-line '...' / "..." literal, an open $( / ` / ( construct, or after anything
+        the scanner could not track. Ambiguity means NOT executed, so these constructs can
+        only lose the exemption, never grant it."""
+        found: list[int] = []
+        state, logical, first, start_clean = None, "", None, False
+        for i in range(start, len(lines)):
+            info, marker = fences[i]
+            if info is None or marker:  # outside a fence, or a fence marker: reset state
+                state, logical, first = None, "", None
+                continue
+            if state is None:
+                state = ShellState()
+            if not logical and state.in_heredoc(lines[i]):  # heredoc body / delimiter
+                continue
+            if not logical:
+                start_clean, first = state.clean(), i
+            logical += lines[i]
+            state.feed(lines[i])
+            if state.continued:
+                logical = logical[:-1] + " "
+                continue
+            if start_clean and state.clean(after_line=True) \
+                    and cls.invokes_resolver(logical, fences[i]):
+                found.append(first)
+            logical = ""
+        return found
 
     def parse_allow(self, path: str, line: int, text: str, lines: list[str]) -> set[str]:
         """Validate a `lint-allow` comment; return the rules it suppresses on the next line."""
@@ -431,6 +454,99 @@ class Linter:
 
 
 # -- shell command-position parsing (for the resolver-invocation check) ------------------
+HEREDOC_RE = re.compile(r"""<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z0-9_.@%+-]+))""")
+
+
+class ShellState:
+    """Cross-line shell lexer state for one fenced block: open quotes / substitutions /
+    subshells (a stack), heredocs announced on the current line (pending) and the one
+    whose body is being read, backslash-newline continuation, and a sticky `broken` flag
+    for anything it cannot classify (unbalanced `)`, unparseable `<<`). Approximate on
+    purpose — every approximation errs toward "not clean"."""
+
+    def __init__(self):
+        self.stack: list[str] = []
+        self.pending: list = []
+        self.heredoc = None  # (delimiter, strip_leading_tabs)
+        self.continued = False
+        self.broken = False
+
+    def clean(self, after_line: bool = False) -> bool:
+        """No open construct. `after_line`: heredocs the line just announced are fine (the
+        announcing line itself still executes)."""
+        busy = self.heredoc is not None and not after_line or (self.pending and not after_line)
+        return not (self.stack or busy or self.broken)
+
+    def in_heredoc(self, text: str) -> bool:
+        """Consume `text` if it is heredoc body or the closing delimiter line."""
+        if self.heredoc is None:
+            return False
+        delim, strip = self.heredoc
+        if (text.lstrip("\t") if strip else text) == delim:
+            self.heredoc = self.pending.pop(0) if self.pending else None
+        return True
+
+    def feed(self, text: str) -> None:
+        self.continued = False
+        i, n = 0, len(text)
+        while i < n:
+            c, top = text[i], (self.stack[-1] if self.stack else None)
+            if top == "'":
+                if c == "'":
+                    self.stack.pop()
+                i += 1
+                continue
+            if c == "\\":
+                if i == n - 1:
+                    self.continued = True
+                i += 2
+                continue
+            if top == '"':
+                if c == '"':
+                    self.stack.pop()
+                elif text.startswith("$(", i):
+                    self.stack.append("$(")
+                    i += 1
+                elif c == "`":
+                    self.stack.append("`")
+                i += 1
+                continue
+            if c in "'\"":
+                self.stack.append(c)
+            elif text.startswith("$(", i):
+                self.stack.append("$(")
+                i += 1
+            elif c == "(":
+                self.stack.append("(")
+            elif c == ")":
+                if top in ("(", "$("):
+                    self.stack.pop()
+                else:
+                    self.broken = True
+            elif c == "`":
+                if top == "`":
+                    self.stack.pop()
+                else:
+                    self.stack.append("`")
+            elif c == "#" and (i == 0 or text[i - 1] in " \t;&|("):
+                break  # comment to end of line
+            elif text.startswith("<<", i) and not text.startswith("<<<", i):
+                m = HEREDOC_RE.match(text, i)
+                if not m:
+                    self.broken = True
+                    break
+                delim = next(g for g in m.groups()[1:] if g is not None)
+                self.pending.append((delim, m.group(1) == "-"))
+                i = m.end()
+                continue
+            elif text.startswith("<<<", i):
+                i += 3
+                continue
+            i += 1
+        if not self.continued and self.pending and self.heredoc is None:
+            self.heredoc = self.pending.pop(0)  # bodies start on the next line
+
+
 def _close_paren(s: str, i: int):
     """Index of the `)` closing a `$(` whose body starts at i (quotes and nesting aware)."""
     depth, q = 1, None
@@ -554,6 +670,30 @@ INVOCATIONS_BAD = (
     "python3 -I scripts/resolve_endpoint.py",
     "python3 -I scripts/not_resolve_endpoint.py spark.connect_uri",
     'echo "unbalanced $(python3 -I scripts/resolve_endpoint.py spark.connect_uri"',
+)
+
+R = "python3 -I scripts/resolve_endpoint.py spark.connect_uri"
+# (label, fenced block body, counts as an invocation?) — cross-line shell state.
+MULTILINE_BLOCKS = (
+    ("quoted heredoc", f"cat <<'EOF'\n{R}\nEOF", False),
+    ("double-quoted heredoc delimiter", f'cat <<"EOF"\n{R}\nEOF', False),
+    ("unquoted heredoc", f"cat <<EOF\n{R}\nEOF", False),
+    ("unquoted heredoc with substitution", f"cat <<EOF\nx=$({R})\nEOF", False),
+    ("<<- heredoc, tab-indented delimiter", f"cat <<-EOF\n\t{R}\n\tEOF", False),
+    ("two heredocs on one line", f"cat <<A <<B\na\nA\n{R}\nB", False),
+    ("unterminated heredoc swallows the rest", f"cat <<EOF\nbody\n{R}", False),
+    ("multi-line single-quoted literal", f"msg='first line\n{R}\nlast'", False),
+    ("multi-line double-quoted literal", f'msg="first line\n{R}\nlast"', False),
+    ("multi-line $( substitution (ambiguous -> not counted)", f"x=$(\n  {R}\n)", False),
+    ("line ends inside an open quote", f'{R}; echo "dangling\nrest"', False),
+    ("unparseable <<", f"cat << \n{R}", False),
+    ("unbalanced ) poisons the rest of the block", f"echo )\n{R}", False),
+    ("after a heredoc closes", f"cat <<'EOF'\nbody\nEOF\n{R}", True),
+    ("after a multi-line literal closes", f"msg='a\nb'\n{R}", True),
+    ("backslash-continued invocation",
+     "python3 -I scripts/resolve_endpoint.py \\\n  spark.connect_uri --format env", True),
+    ("here-string is not a heredoc", f"cat <<< hi\n{R}", True),
+    ("real eval form", f'eval "$({R} --profile "<name>" --format env)"', True),
 )
 
 
@@ -694,11 +834,43 @@ echo python3 -I scripts/resolve_endpoint.py spark.connect_uri
 printf '%s\n' "python3 -I scripts/resolve_endpoint.py spark.connect_uri"
 msg="python3 -I scripts/resolve_endpoint.py spark.connect_uri"
 echo 'eval "$(python3 -I scripts/resolve_endpoint.py spark.connect_uri)"'
+cat <<'EOF'
+python3 -I scripts/resolve_endpoint.py spark.connect_uri
+EOF
+cat <<EOF
+python3 -I scripts/resolve_endpoint.py spark.connect_uri
+EOF
+note='multi-line single-quoted
+python3 -I scripts/resolve_endpoint.py spark.connect_uri
+'
+note="multi-line double-quoted
+python3 -I scripts/resolve_endpoint.py spark.connect_uri
+"
 ```
 
 The preferred default is `sc://<host>:15002`.
 """
 MENTION_ONLY_EXPECT = {"bare-port": 1}
+
+# One skill per multi-line construct: the resolver line inside it is NOT executed, so the
+# labeled port must stay flagged (exactly one bare-port each).
+CONSTRUCT_SKILL = """---
+name: {slug}
+description: Load when testing that a resolver line inside a {what} is not an invocation.
+---
+
+```bash
+{block}
+```
+
+The preferred default is `sc://<host>:15002`.
+"""
+CONSTRUCT_FIXTURES = {
+    "heredoc-quoted-skill": ("quoted heredoc", "cat <<'EOF'\n" + R + "\nEOF"),
+    "heredoc-unquoted-skill": ("unquoted heredoc", "cat <<EOF\n" + R + "\nEOF"),
+    "squote-multiline-skill": ("multi-line single-quoted string", "note='start\n" + R + "\nend'"),
+    "dquote-multiline-skill": ("multi-line double-quoted string", 'note="start\n' + R + '\nend"'),
+}
 
 BAD_EXPECT = {
     "name": 1, "frontmatter-key": 1, "metadata": 1, "sc-localhost": 1, "localhost": 4,
@@ -716,7 +888,9 @@ def self_test() -> int:
         tmp = os.path.join(tmp, "skills")
         for slug, text in (("good-skill", GOOD), ("other-skill", GOOD.replace("good-skill", "other-skill")),
                            ("bad-skill", BAD), ("resolver-skill", GOOD_RESOLVER),
-                           ("assume-skill", BAD_RESOLVER), ("mention-skill", MENTION_ONLY)):
+                           ("assume-skill", BAD_RESOLVER), ("mention-skill", MENTION_ONLY),
+                           *((slug, CONSTRUCT_SKILL.format(slug=slug, what=what, block=block))
+                             for slug, (what, block) in CONSTRUCT_FIXTURES.items())):
             os.makedirs(os.path.join(tmp, slug))
             with open(os.path.join(tmp, slug, "SKILL.md"), "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -741,6 +915,11 @@ def self_test() -> int:
                 counts[rule] = counts.get(rule, 0) + 1
         if counts != expect:
             failures.append(f"{slug} rule counts {counts} != expected {expect}")
+    for slug, *_ in CONSTRUCT_FIXTURES.items():
+        got = [v for v in linter.violations if f"/{slug}/" in v]
+        if len(got) != 1 or "[bare-port]" not in got[0] or "never invokes" not in got[0]:
+            failures.append(f"{slug}: resolver line inside the construct granted the exemption "
+                            f"or flagged wrongly: {got}")
     for slug in ("bad-skill", "mention-skill"):
         hint = [v for v in linter.violations if f"/{slug}/" in v and "never invokes" in v]
         if len(hint) != 1:
@@ -750,15 +929,22 @@ def self_test() -> int:
     wrong += [ln for ln in INVOCATIONS_BAD if probe(ln, ("bash", None))]
     if wrong:
         failures.append(f"resolver-invocation parsing wrong for: {wrong}")
+    for label, block, want in MULTILINE_BLOCKS:
+        blines = ["```bash"] + block.split("\n") + ["```"]
+        got = Linter.resolver_lines(blines, Linter.fence_info(blines, 0))
+        if bool(got) != want:
+            failures.append(f"multi-line block '{label}': expected invocation={want}, got lines {got}")
     for f in failures:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     if failures:
         return 1
     print(f"self-test OK: {len(clean)} clean fixtures have 0 flags; bad fixtures flag "
           f"{sum(BAD_EXPECT.values())} + {sum(BAD_RESOLVER_EXPECT.values())} + "
-          f"{sum(MENTION_ONLY_EXPECT.values())} expected violations; "
+          f"{sum(MENTION_ONLY_EXPECT.values())} expected violations; {len(CONSTRUCT_FIXTURES)} "
+          "heredoc / multi-line-literal skills keep their labeled port flagged; "
           f"escaping symlink dir rejected; {len(INVOCATIONS_OK)} invocation / "
-          f"{len(INVOCATIONS_BAD)} non-invocation command lines classified correctly")
+          f"{len(INVOCATIONS_BAD)} non-invocation command lines and {len(MULTILINE_BLOCKS)} "
+          "multi-line blocks classified correctly")
     return 0
 
 
