@@ -52,9 +52,24 @@ servers; bundling/operating the compute stack itself.
    connection + profile selection + a tool/version floor check, then routes to the
    matching product skill. Product skills declare `parent: lakehouse-core` (in portable
    `metadata`) and open with "FIRST: use the parent skill."
-4. **Stack-agnostic by construction.** No hardcoded `localhost:PORT`, container name, or
-   repo path in a skill body — everything stack-specific comes from a **lakehouse
-   connection profile** (env vars + a config file), with documented placeholders.
+4. **Discover, don't hardcode; prefer, don't guess.** No skill body contains a literal
+   `localhost:PORT`, container name, or repo path. Every environment-specific value is
+   resolved at runtime in a fixed **resolution order**:
+   1. **Explicit config** — a profile/env value, if set, is authoritative.
+   2. **Discover** — otherwise probe the live environment: teach the agent the *discovery
+      command* (ask the tool/API for its configured endpoint, test whether the
+      conventional port is reachable, list running containers, read a well-known config
+      file), never a baked-in answer.
+   3. **Preferred default** — fall back to the conventional port/name (the "prefer X")
+      only after verifying it is actually reachable, and label it as a preference.
+   4. **Fail loud** — if nothing resolves, stop with a clear message on how to set it.
+
+   Topology is *discovered*; **identity and targeting with side effects** (which profile,
+   catalog, schema, bucket, or credentials to act on) is **never** guessed — that keeps
+   the `lakehouse-core` "never auto-select" rule intact. Concretely: "use Spark on 15002"
+   becomes "resolve the Spark Connect endpoint from config; else discover a reachable one,
+   preferring 15002; verify before use; otherwise report how to set it." `lakehouse-core`
+   ships shared resolver helpers so every skill applies this order identically.
 5. **Separate engine knowledge from stack operations.** Portable engine skills vs.
    reference-stack operations skills (the latter opt-in, tied to a concrete deployment).
 6. **One source of truth → many targets.** A single metadata file + generator produces
@@ -125,6 +140,12 @@ From the reference repo's 12 skills:
 **9 portable engine skills** form v1's core. **3** are deployment-bound and move to an
 opt-in `reference-stack` profile.
 
+Every "Generalization work" note above is an instance of the §3.4 resolution order:
+"replace `<host:port>`/container name with profile vars" means *resolve via config →
+discover → preferred default → fail*, calling the shared `lakehouse-core` resolver helpers
+rather than re-implementing discovery in each skill. Each port/endpoint a source skill
+hardcodes becomes a documented *preferred default*, not an assumption.
+
 ## 6. The central problem: the connection-profile abstraction
 
 Every coupling point the reference skills bake in must become a **profile value**:
@@ -137,11 +158,19 @@ Every coupling point the reference skills bake in must become a **profile value*
   inlined.
 - Naming: catalogs/schemas/buckets/warehouse paths — defaults overridable per profile.
 
+Profiles express **preferred defaults, not hard assumptions.** A value that is present in
+the profile is authoritative; a value that is *absent* triggers the resolution order from
+§3.4 (discover → preferred default → fail loud), not an immediate error — so a deployment
+that moved Kafka off 9092 or runs Spark Connect on a non-standard port still works without
+anyone editing the skill. Only *identity/targeting* resolution refuses to guess.
+
 Deliverables: `templates/lakehouse.profile.example.*` (the contract), a `docs/` guide,
-a `lakehouse-core` routine that detects/validates a profile and refuses to guess (mirrors
-the Databricks "NEVER auto-select a profile" rule), and a shipped
-`reference-stack.profile` that reproduces the open-lakehouse compose values so the
-runbook skills still work out of the box.
+shared `lakehouse-core` **resolver helpers** (one implementation of config → discover →
+preferred-default → fail that every product skill calls, so discovery/preference logic is
+never re-hand-rolled per skill), a `lakehouse-core` routine that detects/validates a
+profile and refuses to guess *identity* (mirrors the Databricks "NEVER auto-select a
+profile" rule), and a shipped `reference-stack.profile` that reproduces the open-lakehouse
+compose values so the runbook skills still work out of the box.
 
 ## 7. Distribution & versioning
 
@@ -183,9 +212,16 @@ Each must be re-verified against a running stack before the skill ships.
 - **Phase 1 — Foundations.** `lakehouse-core` parent skill; connection-profile contract +
   reference-stack profile; skills linter + frontmatter/portability validator; `plugin.meta.json`
   + generator producing one target.
+- **Phase 1.5 — Resolver + lint for generalization (pre-req for Phase 2).** Add shared
+  **resolver helpers** to `lakehouse-core` implementing the §3.4 order (config → discover →
+  preferred default → fail) once, for all skills to call; extend the skills linter to flag
+  literal `localhost:PORT`/container names *and* bare port literals used as assumptions
+  (require they appear only as a labeled preferred default behind a resolver). This makes
+  the generalization principle enforceable, not just documented.
 - **Phase 2 — Port the 9 engine skills.** One skill per task/PR, parameterized against the
-  profile, each **cross-reviewed by a different vendor**; resolve the §8 issues; add
-  "verified on" provenance.
+  profile via the resolver helpers (discover-then-prefer, never hardcode), each
+  **cross-reviewed by a different vendor**; resolve the §8 issues; add "verified on"
+  provenance.
 - **Phase 3 — Reference-stack ops.** `lifecycle` + (decide) `dashboard` + delta-sharing proxy,
   as the opt-in reference-stack profile.
 - **Phase 4 — Distribution.** Multi-target generation + marketplace + `pip`/`uvx` installer;
