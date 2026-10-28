@@ -97,21 +97,36 @@ skills that already exist; name planned ones in backticks.
 port as a *preference*. The linter accepts a port literal (`bare-port`, `port-assumption`)
 only when both hold:
 
-- the skill body calls the shared resolver (mentions `resolve_endpoint.py`), and
+- the skill **invokes** the shared resolver: a command line running
+  `python3 … resolve_endpoint.py <section>.<key>` inside a code fence. Prose mentions
+  (including "do not use `resolve_endpoint.py`"), shell comments (`# …`, also trailing),
+  HTML comments, and `output` / `text` / `log` / `markdown` fences do not count; and
 - the literal is labeled: the same line says "preferred default", "prefer…" or
   "conventional", **or** it sits under a heading containing "Preferred default(s)" (the
   context lasts until the next heading of the same or a higher level).
 
-```markdown
-Resolve it with `python3 -I scripts/resolve_endpoint.py spark.connect_uri`; with nothing
-configured or discovered it tries the preferred default `sc://<host>:15002`.
+````markdown
+```bash
+eval "$(python3 -I scripts/resolve_endpoint.py spark.connect_uri --profile "$LAKEHOUSE_PROFILE" --format env)"
 ```
+With nothing configured or discovered it tries the preferred default `sc://<host>:15002`.
+````
 
 Hosts are never exempt this way — use `<host>` / placeholders. Placeholders such as
-`<host>:<PREFERRED_PORT>`, `sc://host:port`, or `sc://SPARK_HOST` are never flagged.
-Example command **output** goes in a fence tagged `output` (```` ```output ````): port rules
-skip it (version numbers, dates, times, and `file.py:42` refs are never flagged anyway),
-but host rules (`localhost:`, `127.0.0.1`, `sc://…`) still apply.
+`<host>:<PREFERRED_PORT>`, `sc://host:port`, or `sc://SPARK_HOST` are never flagged, nor
+are version numbers, dates, times, or `file.py:42` refs.
+
+**Example command output gets no blanket exemption** — a port inside ```` ```output ````
+is flagged like any other. If shown output really must contain a port, put a scoped
+`lint-allow` on the line directly before the fence; it then covers that one fenced block
+(a comment inside a fence would render as part of it):
+
+````markdown
+<!-- lint-allow: bare-port -- example server log output, not an endpoint to use -->
+```output
+Server listening on :15002
+```
+````
 
 To show a deliberate anti-pattern, put a standalone comment on the line **before** it,
 naming the rule(s) and why:
@@ -120,7 +135,7 @@ naming the rule(s) and why:
 <!-- lint-allow: localhost -- shows readers the hardcoded form to avoid -->
 ```
 
-It exempts only the next line and only the named rules (`sc-localhost`, `loopback-ip`,
-`localhost`, `sc-uri`, `docker-exec`, `bare-port`, `port-assumption`); a malformed,
-inline, or unjustified
+It exempts only the next line (or, when that line opens a code fence, that whole fenced
+block) and only the named rules (`sc-localhost`, `loopback-ip`, `localhost`, `sc-uri`,
+`docker-exec`, `bare-port`, `port-assumption`); a malformed, inline, or unjustified
 `lint-allow` is itself a violation.

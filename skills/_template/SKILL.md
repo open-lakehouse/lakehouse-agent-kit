@@ -46,7 +46,8 @@ act on; confirm those.
 ## <Task section>
 
 ```bash
-# endpoint is the RESOLVED value from the step above — not a baked-in host/port literal
+# resolve first (config -> discover -> preferred default -> fail), then use the RESOLVED value
+eval "$(python3 -I <lakehouse-core>/scripts/resolve_endpoint.py <section>.<key> --profile "<name-the-user-chose>" --format env)"
 <cli> --endpoint "$LAKEHOUSE_<SECTION>_<KEY>" ...
 ```
 
