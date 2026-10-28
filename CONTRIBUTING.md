@@ -97,10 +97,13 @@ skills that already exist; name planned ones in backticks.
 port as a *preference*. The linter accepts a port literal (`bare-port`, `port-assumption`)
 only when both hold:
 
-- the skill **invokes** the shared resolver: a command line running
-  `python3 … resolve_endpoint.py <section>.<key>` inside a code fence. Prose mentions
-  (including "do not use `resolve_endpoint.py`"), shell comments (`# …`, also trailing),
-  HTML comments, and `output` / `text` / `log` / `markdown` fences do not count; and
+- the skill **invokes** the shared resolver: inside a code fence, `python3 [opts]
+  …/resolve_endpoint.py <section>.<key>` is the *executed* command — at the start of a
+  simple command (after `;`, `&&`, `||`, `|`, optional `VAR=…` / `env` / `exec`), or inside
+  a `$(…)` / backtick substitution such as `eval "$(python3 … --format env)"`. It does not
+  count as an argument (`echo python3 …`, `printf … "python3 …"`), inside quoted text
+  (`msg="python3 …"`, `'…$(python3 …)…'`), in shell comments (`# …`, also trailing), in
+  prose or HTML comments, or in `output` / `text` / `log` / `markdown` fences; and
 - the literal is labeled: the same line says "preferred default", "prefer…" or
   "conventional", **or** it sits under a heading containing "Preferred default(s)" (the
   context lasts until the next heading of the same or a higher level).

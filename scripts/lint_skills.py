@@ -13,10 +13,10 @@ Stdlib-only; run as `python3 -I scripts/lint_skills.py`. Checks:
   portability   no hardcoded `localhost:`, `127.0.0.1`, `sc://<literal-host>`, literal
                 `docker exec <container-name>`, bare `:PORT` literals, or prose port
                 assumptions (`port 9092`). A port literal is allowed only as a LABELED
-                preferred default in a skill that INVOKES lakehouse-core's resolver (a
-                non-comment command line `python3 … resolve_endpoint.py <section>.<key>`
-                inside a code fence that is not an `output`/`text` fence; prose mentions
-                do not count): the line says "preferred default" / "prefer…" /
+                preferred default in a skill that INVOKES lakehouse-core's resolver
+                (inside a non-`output`/`text` code fence, `python3 … resolve_endpoint.py
+                <section>.<key>` in command position — not echoed, quoted, or commented;
+                `$(...)` substitutions count): the line says "preferred default" / "prefer…" /
                 "conventional", or sits under a heading containing "preferred default".
                 Fences get no blanket exemption — not even ```output.
   links         every [[skill-link]] is a kebab-case slug that resolves to an existing
@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import sys
 import tempfile
 
@@ -93,11 +94,15 @@ FILE_REF_RE = re.compile(
 PORT_WORD_RE = re.compile(r"\bports?\s+(?:number\s+)?(\d{2,5})\b", re.I)
 # Labels that make a port literal a stated preference rather than an assumption...
 PREFERRED_LABEL_RE = re.compile(r"\bpreferred[ -]defaults?\b|\bprefer(?:s|red|ring)?\b|\bconventional\b", re.I)
-# ...honored only when the skill actually INVOKES the shared resolver: a python command
-# running resolve_endpoint.py on a section.key, on a fenced (non-output) command line.
-RESOLVER_CALL_RE = re.compile(
-    r"(?:^|[\s(`\"'$;&|])python3?(?:\s+-[A-Za-z]+)*\s+[^\s\"'`]*\bresolve_endpoint\.py"
-    r"\s+[\"']?[a-z_]+\.[a-z_]+\b")
+# ...honored only when the skill actually INVOKES the shared resolver: on a fenced
+# (non-output) command line, a simple command in COMMAND POSITION — top level or inside a
+# `$(...)` / backtick substitution — whose executable is python and whose script is
+# resolve_endpoint.py with a section.key argument (see resolver_invocations()).
+PYTHON_RE = re.compile(r"(?:.*/)?python(?:3(?:\.\d+)?)?")
+ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+ENDPOINT_ARG_RE = re.compile(r"[a-z_]+\.[a-z_]+")
+CMD_WRAPPERS = {"exec", "command", "time", "nohup", "env"}
+PY_VALUE_OPTS = {"-X", "-W", "-Q"}       # python options that consume the next token
 NON_COMMAND_FENCES = {"output", "text", "txt", "plain", "plaintext", "log", "md", "markdown"}
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([\w-]*)")
@@ -168,7 +173,17 @@ class Linter:
                         f"body is {body_lines} lines (> {MAX_BODY_LINES}); move depth into references/")
 
         fences = self.fence_info(lines, end + 1)
-        has_resolver = any(self.invokes_resolver(lines[i], fences[i]) for i in range(end + 1, len(lines)))
+        has_resolver, logical = False, ""
+        for i in range(end + 1, len(lines)):  # join `\`-continued lines within a fence
+            if fences[i][0] is None or fences[i][1]:
+                logical = ""
+                continue
+            logical += lines[i]
+            if logical.endswith("\\"):
+                logical = logical[:-1] + " "
+                continue
+            has_resolver = has_resolver or self.invokes_resolver(logical, fences[i])
+            logical = ""
         allowed: set[str] = set()        # rules suppressed for the current line
         fence_allowed: set[str] = set()  # rules suppressed for the whole current fence
         label_level = 0                  # heading level of an open "preferred default" section
@@ -214,13 +229,13 @@ class Linter:
 
     @staticmethod
     def invokes_resolver(text: str, fence) -> bool:
-        """A real resolver invocation: a command line inside a non-output code fence, with
-        shell comments (`# …`, including trailing ones) removed first."""
+        """A real resolver invocation: a command line inside a non-output code fence that
+        runs resolve_endpoint.py in command position (not echoed, quoted, or commented)."""
         info, marker = fence
         if info is None or marker or info in NON_COMMAND_FENCES:
             return False
-        line = re.sub(r"(?:^|\s)#.*$", "", text.strip())
-        return bool(RESOLVER_CALL_RE.search(line))
+        line = re.sub(r"^\s*\$\s+", "", text)  # console prompt `$ cmd`
+        return any(is_resolver_command(cmd) for cmd in shell_commands(line))
 
     def parse_allow(self, path: str, line: int, text: str, lines: list[str]) -> set[str]:
         """Validate a `lint-allow` comment; return the rules it suppresses on the next line."""
@@ -415,6 +430,133 @@ class Linter:
                 self.report(path, line, "link", f"[[{target}]] does not resolve to skills/{target}/SKILL.md")
 
 
+# -- shell command-position parsing (for the resolver-invocation check) ------------------
+def _close_paren(s: str, i: int):
+    """Index of the `)` closing a `$(` whose body starts at i (quotes and nesting aware)."""
+    depth, q = 1, None
+    while i < len(s):
+        c = s[i]
+        if q:
+            if c == "\\" and q == '"':
+                i += 1
+            elif c == q:
+                q = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            q = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def shell_commands(line: str) -> list:
+    """Every simple command a shell would EXECUTE on this line, as token lists: the top
+    level (split on ; && || | &) plus, recursively, `$(...)` / backtick substitution bodies
+    (which execute even inside double quotes). Single-quoted text, double-quoted literal
+    text, and `# comments` never yield commands. Unparseable input yields nothing."""
+    top, subs, q, i = [], [], None, 0
+    while i < len(line):
+        c = line[i]
+        if q == "'":
+            q = None if c == "'" else q
+            top.append(c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < len(line):
+            top.append(line[i:i + 2])
+            i += 2
+            continue
+        if line.startswith("$(", i) and not line.startswith("$((", i):
+            j = _close_paren(line, i + 2)
+            if j is None:
+                return []
+            subs.append(line[i + 2:j])
+            top.append("SUBST")
+            i = j + 1
+            continue
+        if c == "`":
+            j = line.find("`", i + 1)
+            if j < 0:
+                return []
+            subs.append(line[i + 1:j])
+            top.append("SUBST")
+            i = j + 1
+            continue
+        if q == '"':
+            q = None if c == '"' else q
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or line[i - 1].isspace()):
+            break  # unquoted comment: the rest of the line is not executed
+        top.append(c)
+        i += 1
+    try:
+        lex = shlex.shlex("".join(top), posix=True, punctuation_chars=";&|")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        tokens = list(lex)
+    except ValueError:
+        return []
+    cmds, cur = [], []
+    for tok in tokens:
+        if tok and set(tok) <= set(";&|"):
+            cmds.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    cmds.append(cur)
+    for body in subs:
+        cmds.extend(shell_commands(body))
+    return [c for c in cmds if c]
+
+
+def is_resolver_command(tokens: list) -> bool:
+    """`[VAR=x ...] [exec|command|time|nohup|env ...] python3 [opts] .../resolve_endpoint.py
+    <section>.<key> ...` — python is the executed command, the script is its first operand."""
+    i = 0
+    while i < len(tokens) and (ASSIGN_RE.fullmatch(tokens[i]) or tokens[i] in CMD_WRAPPERS):
+        i += 1
+    if i >= len(tokens) or not PYTHON_RE.fullmatch(tokens[i]):
+        return False
+    i += 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        if tokens[i] in ("-c", "-m") or tokens[i] == "-":
+            return False  # running code / a module / stdin, not the script
+        i += 2 if tokens[i] in PY_VALUE_OPTS else 1
+    return (i + 1 < len(tokens) and os.path.basename(tokens[i]) == "resolve_endpoint.py"
+            and bool(ENDPOINT_ARG_RE.fullmatch(tokens[i + 1])))
+
+
+INVOCATIONS_OK = (
+    "python3 -I scripts/resolve_endpoint.py spark.connect_uri",
+    'eval "$(python3 -I scripts/resolve_endpoint.py spark.connect_uri --format env)"',
+    "uri=$(python3 -I x/resolve_endpoint.py kafka.bootstrap_servers)",
+    "uri=`python3 x/resolve_endpoint.py kafka.bootstrap_servers`",
+    "cd skills/lakehouse-core && python3 -I scripts/resolve_endpoint.py mlflow.tracking_uri",
+    "LAKEHOUSE_PROFILE=dev /usr/bin/python3.12 -I -X utf8 resolve_endpoint.py spark.connect_uri",
+    "$ python3 -I scripts/resolve_endpoint.py spark.connect_uri",
+)
+INVOCATIONS_BAD = (
+    "echo python3 -I scripts/resolve_endpoint.py spark.connect_uri",
+    "printf '%s\\n' \"python3 -I scripts/resolve_endpoint.py spark.connect_uri\"",
+    'msg="python3 -I scripts/resolve_endpoint.py spark.connect_uri"',
+    "echo 'eval \"$(python3 -I scripts/resolve_endpoint.py spark.connect_uri)\"'",
+    'echo "python3 -I scripts/resolve_endpoint.py spark.connect_uri"',
+    "# python3 -I scripts/resolve_endpoint.py spark.connect_uri",
+    "true # $(python3 -I scripts/resolve_endpoint.py spark.connect_uri)",
+    'python3 -c "resolve_endpoint.py spark.connect_uri"',
+    "python3 -I scripts/resolve_endpoint.py",
+    "python3 -I scripts/not_resolve_endpoint.py spark.connect_uri",
+    'echo "unbalanced $(python3 -I scripts/resolve_endpoint.py spark.connect_uri"',
+)
+
+
 # -- self-test -------------------------------------------------------------------------
 GOOD = """---
 name: good-skill
@@ -547,6 +689,12 @@ $ python3 -I scripts/resolve_endpoint.py spark.connect_uri
 ```text
 python3 -I scripts/resolve_endpoint.py spark.connect_uri
 ```
+```bash
+echo python3 -I scripts/resolve_endpoint.py spark.connect_uri
+printf '%s\n' "python3 -I scripts/resolve_endpoint.py spark.connect_uri"
+msg="python3 -I scripts/resolve_endpoint.py spark.connect_uri"
+echo 'eval "$(python3 -I scripts/resolve_endpoint.py spark.connect_uri)"'
+```
 
 The preferred default is `sc://<host>:15002`.
 """
@@ -597,6 +745,11 @@ def self_test() -> int:
         hint = [v for v in linter.violations if f"/{slug}/" in v and "never invokes" in v]
         if len(hint) != 1:
             failures.append(f"{slug}: labeled-without-resolver port not reported exactly once: {hint}")
+    probe = Linter.invokes_resolver
+    wrong = [ln for ln in INVOCATIONS_OK if not probe(ln, ("bash", None))]
+    wrong += [ln for ln in INVOCATIONS_BAD if probe(ln, ("bash", None))]
+    if wrong:
+        failures.append(f"resolver-invocation parsing wrong for: {wrong}")
     for f in failures:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     if failures:
@@ -604,7 +757,8 @@ def self_test() -> int:
     print(f"self-test OK: {len(clean)} clean fixtures have 0 flags; bad fixtures flag "
           f"{sum(BAD_EXPECT.values())} + {sum(BAD_RESOLVER_EXPECT.values())} + "
           f"{sum(MENTION_ONLY_EXPECT.values())} expected violations; "
-          "escaping symlink dir rejected")
+          f"escaping symlink dir rejected; {len(INVOCATIONS_OK)} invocation / "
+          f"{len(INVOCATIONS_BAD)} non-invocation command lines classified correctly")
     return 0
 
 
