@@ -702,6 +702,32 @@ def self_test() -> int:
             if not (code == 2 and out == "" and "identity/targeting" in err and "SENTINEL" not in err):
                 bad.append((key, code, err))
         expect(f"refuses {len(ident)} identity/targeting keys (exit 2, value never shown)", not bad, str(bad))
+        # Explicit boundary cases: region and k8s targeting are refused BEFORE any lookup —
+        # no profile file is opened (a missing --file would otherwise error), no env value is
+        # read or echoed, no TCP probe and no `docker ps` happen.
+        ps_calls: list = []
+
+        def ps_spy(timeout):
+            ps_calls.append(timeout)
+            return []
+        bad = []
+        for key, var in (("object_store.region", "LAKEHOUSE_OBJECT_STORE_REGION"),
+                         ("k8s.namespace", "LAKEHOUSE_K8S_NAMESPACE"),
+                         ("k8s.context", "LAKEHOUSE_K8S_CONTEXT")):
+            spy = _probe_set(("localhost", 15002))
+            missing = os.path.join(tmp, "no-such-dir", "absent.profile.toml")
+            for argv in ([key], [key, "--file", missing, "--invocation", "docker"],
+                         [key, "--profile", "nope", "--candidate", "h:1", "--format", "env"]):
+                code, out, err = _call(argv, {**env, var: "TARGET-SENTINEL"}, tmp, spy, ps_spy)
+                if not (code == 2 and out == "" and "identity/targeting" in err
+                        and "SENTINEL" not in err and "not found" not in err
+                        and "no profile named" not in err):
+                    bad.append((argv, code, err))
+            if spy.calls:
+                bad.append((key, "probed", spy.calls))
+        expect("object_store.region, k8s.namespace, k8s.context refused (exit 2) before any "
+               "profile/env lookup, probe, or docker call", not bad and not ps_calls,
+               f"{bad} docker={ps_calls}")
         code, out, err = _call(["spark.connect_uri", "--profile", "nope"], env, tmp, nothing)
         expect("unknown --profile -> exit 2 (selection errors relayed, nothing guessed)",
                code == 2 and "no profile named" in err, f"{code} {err!r}")

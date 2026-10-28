@@ -9,6 +9,13 @@
 # Use it:  python3 -I skills/lakehouse-core/scripts/load_profile.py --file templates/reference-stack.profile.toml
 #          (or copy it to ~/.config/lakehouse/ and select it with --profile reference-stack)
 #
+# HOST-PUBLISHED VIEW: every endpoint below is the host-side `localhost:<published port>`.
+# `invocation = "docker"` only changes how CLI binaries are launched (`docker exec` into the
+# named container); it does NOT make these container-local addresses. Inside a container
+# `localhost` is that container itself, and in-network names/ports differ (e.g. UC is
+# `unity-catalog:8080`, Kafka `kafka:9092` on the INTERNAL listener). A cross-container
+# consumer must not reuse these values as-is — give it the in-network endpoint instead.
+#
 # Every value is verified against open-lakehouse/open-lakehouse @ 39f32e68191828f39dc1f21d41d20506b5d4a292
 # (2026-10-27); the cited path:line is in that commit. Secrets stay in env vars named
 # by the *_env keys (the stack's own .env names); never put their values here.
