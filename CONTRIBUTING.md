@@ -57,7 +57,8 @@ error on other platforms.
    ✅ Resolve the Spark Connect endpoint: use `$LAKEHOUSE_SPARK_CONNECT_URI` / the profile
       if set; else check whether a Spark Connect server is reachable (preferring the
       conventional port 15002) and use that; else report that no endpoint was found and
-      how to set one. Then: `spark-sql --remote "$LAKEHOUSE_SPARK_CONNECT_URI"`
+      how to set one. Then connect with PySpark (Spark 4.1+; `spark-sql --remote` fails):
+      `SparkSession.builder.remote("$LAKEHOUSE_SPARK_CONNECT_URI").getOrCreate()`
    ```
 3. **No secrets inline.** Reference credentials by env-var name.
 4. **Invocation modes are explicit.** If a step runs a CLI, show the profile-driven form
