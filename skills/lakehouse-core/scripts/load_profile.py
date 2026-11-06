@@ -45,6 +45,9 @@ CLI_SECTIONS = ("spark", "kafka", "mlflow", "airflow")
 CONTROL_VARS = ("LAKEHOUSE_PROFILE", "LAKEHOUSE_PROFILE_FILE", "LAKEHOUSE_PROFILE_DIR")
 
 # section -> key -> (type, required). Types are validated in check_value().
+# Profile discovery candidate: (path, [profile].name or None, note).
+Candidate = tuple[str, object, str]
+
 SCHEMA: dict[str, dict[str, tuple[str, bool]]] = {
     "profile": {"name": ("name", True), "invocation": ("invocation", True)},
     "k8s": {"namespace": ("str", False), "context": ("str", False)},
@@ -245,11 +248,11 @@ def search_dirs(environ: dict, cwd: str, home: str) -> list[str]:
     return [cwd, os.path.join(xdg, "lakehouse")]
 
 
-def discover(environ: dict, cwd: str, home: str) -> list[tuple[str, object, str]]:
+def discover(environ: dict, cwd: str, home: str) -> list[Candidate]:
     """Return [(path, [profile].name or None, note)] for every candidate profile file. The
     name is unsanitized (only trimmed, as validation would) and is used for exact --profile
     matching; shown() is applied only when presenting it."""
-    found: list[tuple[str, object, str]] = []
+    found: list[Candidate] = []
     seen = set()
     for d in search_dirs(environ, cwd, home):
         for pattern in ("*.profile.toml", "*.profile.env"):
@@ -267,7 +270,7 @@ def discover(environ: dict, cwd: str, home: str) -> list[tuple[str, object, str]
     return found
 
 
-def candidates_text(cands: list[tuple[str, str]], dirs: list[str]) -> str:
+def candidates_text(cands: list[Candidate], dirs: list[str]) -> str:
     if not cands:
         return f"  (no *.profile.toml / *.profile.env files in: {', '.join(dirs)})"
     return "\n".join(f"  - {note or shown(name)}  ({path})" for path, name, note in cands)
