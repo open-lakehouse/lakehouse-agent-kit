@@ -11,18 +11,11 @@
 | **0 — Bootstrap** | Repo, plan, CONTRIBUTING, skill template, CI skeleton | done, merged |
 | **1 — Foundations** | `lakehouse-core`, connection-profile contract, skills linter, CI | done, merged |
 | **1.5 — Generalization engine** | Shared endpoint **resolver** (config to discover to prefer to fail), lint rules that enforce it, cited `reference-stack` profile | done, merged |
-| **2 — Engine skills** | Port the 9 engine skills, each resolver-driven + cross-reviewed | in progress (pilot specced; see note) |
+| **2 — Engine skills** | Port the 9 engine skills, each resolver-driven + reviewed | in progress |
 | **3 — Reference-stack ops** | `lifecycle`, `dashboard` (decision), `delta-sharing` | not started |
 | **4 — Distribution** | Single-source generator to plugin marketplace + `pip`/`uvx` installer, CI drift | not started |
 | **5 — MCP (optional)** | Document/bundle complementary community MCP servers | not started |
 | **6 — v1 release** | Docs, examples, versioned release, announce | not started |
-
-> **Pilot note (Phase 2):** `spark`, `delta`, and `iceberg` were implemented and
-> cross-reviewed in a pilot run, but the work was lost before push due to a sandbox disk
-> failure (local-only commits; nothing merged was affected). They are fully specced in
-> `BACKLOG.md` (LAK-1/2/3) including the exact review fixes and the already-resolved §8
-> answers so re-running them is quick. **Process change:** push every reviewed skill branch
-> to the remote immediately after review so reviewed work can't be stranded locally again.
 
 ## The north star
 
@@ -36,7 +29,7 @@ endpoint is resolved from a **lakehouse connection profile** via `lakehouse-core
 
 ### Phase 2 — Engine skills (`type:skill-port`)
 Port each source skill from `open-lakehouse/.claude/skills/` into `skills/<name>/`,
-parameterized against the resolver. **One skill per PR, cross-reviewed by a different vendor.**
+parameterized against the resolver. **One skill per PR, independently reviewed.**
 Skills: `spark`, `delta`, `iceberg`, `unity-catalog`, `kafka`, `airflow`, `mlflow`, `sdp`, `object-store`.
 **Acceptance (every skill):** CONTRIBUTING-compliant frontmatter (6 portable fields);
 `SKILL.md` <= ~500 lines with progressive disclosure; **no hardcoded host/port/container**
@@ -59,7 +52,7 @@ Backlog: **LAK-20**.
 Docs pass, worked examples, versioned release, announcement. Backlog: **LAK-21**.
 
 ### Cross-cutting / tech-debt (`type:tech-debt`, `type:docs`)
-Known fixes and follow-ups surfaced during Phase 1.5 and the Phase 2 pilot. Backlog: **LAK-22 … LAK-30**.
+Known fixes and follow-ups surfaced so far. Backlog: **LAK-22 … LAK-30**.
 
 ## How to pick up a task (for any session/contributor)
 
@@ -73,8 +66,8 @@ Known fixes and follow-ups surfaced during Phase 1.5 and the Phase 2 pilot. Back
 4. **Green the gates** (all exit 0, from repo root):
    `python3 -I scripts/lint_skills.py --skills-dir skills/` and `--self-test`, plus the three
    `skills/lakehouse-core/scripts/*.py --self-test`.
-5. **Cross-review** with a different-vendor agent against the task's acceptance criteria; fix
-   blocking findings; loop until clean.
+5. **Get a review** against the task's acceptance criteria; fix blocking findings; repeat
+   until clean.
 6. **Open a PR** and push the branch promptly; a human merges. Keep each task's file scope
    disjoint (one skill dir) so parallel work doesn't conflict.
 

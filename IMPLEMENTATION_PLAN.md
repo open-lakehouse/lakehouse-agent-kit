@@ -1,14 +1,15 @@
 # Lakehouse Agent Kit — Implementation Plan (v1)
 
-> Status: **Draft for review** (Lisa, Andre, Tony). Date: 2026-10-21.
-> Owner: TBD. Target: a cross-agent **Lakehouse Agent Kit** — the
-> open-source analogue of the Databricks agent toolkit (`databricks/databricks-agent-skills`).
+> Status: **Draft.** Target: a cross-agent **Lakehouse Agent Kit** for the open lakehouse,
+> in the spirit of vendor agent toolkits such as
+> [`databricks/databricks-agent-skills`](https://github.com/databricks/databricks-agent-skills).
 
 ---
 
 ## 1. Why
 
-We have a Databricks agent toolkit (a parent `databricks-core` skill + ~30 product
+Vendor platforms already ship agent toolkits — for example, the public
+`databricks/databricks-agent-skills` repo (a parent `databricks-core` skill + product
 skills that drive the `databricks` CLI, distributed as cross-agent plugins). There is
 no equivalent for an **open** lakehouse stack (Spark + Delta + Iceberg + Unity Catalog
 OSS + Kafka + Airflow + MLflow + Delta Sharing).
@@ -19,7 +20,7 @@ are high-quality but **welded to that one repo's Docker Compose stack** — hard
 `localhost` ports, container names, a 147 KB `./lakehouse` CLI, repo-relative paths, and
 pinned versions. The opportunity: **extract the portable engine knowledge into a
 standalone, parameterized, cross-agent toolkit** that works against *any* deployment of
-the stack, and distribute it the way the Databricks toolkit is distributed.
+the stack, and distribute it through the same cross-agent channels.
 
 ## 2. What we're building
 
@@ -220,7 +221,7 @@ Each must be re-verified against a running stack before the skill ships.
   the generalization principle enforceable, not just documented.
 - **Phase 2 — Port the 9 engine skills.** One skill per task/PR, parameterized against the
   profile via the resolver helpers (discover-then-prefer, never hardcode), each
-  **cross-reviewed by a different vendor**; resolve the §8 issues; add "verified on"
+  **independently reviewed**; resolve the §8 issues; add "verified on"
   provenance.
 - **Phase 3 — Reference-stack ops.** `lifecycle` + (decide) `dashboard` + delta-sharing proxy,
   as the opt-in reference-stack profile.
@@ -229,7 +230,7 @@ Each must be re-verified against a running stack before the skill ships.
 - **Phase 5 — MCP (optional).** Document/bundle complementary community MCP servers.
 - **Phase 6 — v1 release.** Docs, examples, versioned release, announce.
 
-## 10. Open decisions for Andre & Tony
+## 10. Open decisions
 
 1. **v1 engine scope** — all 9, or a first cut (e.g. spark/delta/iceberg/unity-catalog/kafka)?
 2. **BYO-stack vs. vendor a reference stack** — do we ship/point to a runnable stack, or
@@ -250,13 +251,12 @@ Each must be re-verified against a running stack before the skill ships.
   skill bodies spec-portable; CI parity checks.
 - **Scope creep into a runtime CLI/MCP** — hold the line: skills drive *existing* CLIs in v1.
 
-## 12. How this gets built (delegation model)
+## 12. How changes land
 
-This repo is built by polly's orchestration pattern: each skill or component is a scoped
-**implement** task in its own git worktree that opens its **own PR**; every PR is
-**cross-reviewed by a different-vendor sub-agent** against an acceptance contract; a human
-merges. Investigation/verification tasks (e.g. confirming the §8 contradictions on a
-running stack) are delegated **explore** tasks. polly never merges.
+Each skill or component is a scoped change on its own branch with its **own PR**. Every PR
+is independently reviewed against its acceptance criteria and must pass skills CI before
+a maintainer merges. Factual claims (e.g. the §8 contradictions) are verified against a
+running stack before they ship.
 
 ---
 
@@ -266,4 +266,4 @@ running stack) are delegated **explore** tasks. polly never merges.
 - Packaging/landscape research: Anthropic Agent Skills spec & progressive disclosure;
   Claude Code plugin + marketplace manifests; `databricks/databricks-agent-skills` parent/
   product routing + multi-target generation + `aitools install`; UCFunctionToolkit; community
-  MCP servers. (Full citations in the planning threads.)
+  MCP servers.

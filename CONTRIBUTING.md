@@ -76,8 +76,8 @@ error on other platforms.
 
 ## Review
 
-Every skill/PR is cross-reviewed by a **different-vendor** agent against its acceptance
-contract before a human merges. CI runs the frontmatter/portability linter and the
+Every skill/PR gets an independent review against its acceptance criteria before a
+maintainer merges. CI runs the frontmatter/portability linter and the
 `dist/` drift check.
 
 Run the linter locally before opening a PR:

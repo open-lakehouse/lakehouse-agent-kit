@@ -8,9 +8,9 @@ workflow, and [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the authoring contract.
 <= ~500 lines + progressive disclosure; **no hardcoded host/port/container** — all endpoints
 resolved via `skills/lakehouse-core/scripts/resolve_endpoint.py`, identity (catalog/schema/
 bucket/creds) confirmed never auto-selected; assigned §8 item resolved + cited; provenance
-tags (`verified on <tool>@<ver>, <date>`); all skills-CI gates exit 0; cross-reviewed by a
-different vendor; one skill per PR. Source skills are under `open-lakehouse/.claude/skills/`
-(pin + cite the commit; the pilot used `open-lakehouse@39f32e68`).
+tags (`verified on <tool>@<ver>, <date>`); all skills-CI gates exit 0; independently reviewed;
+one skill per PR. Source skills are under `open-lakehouse/.claude/skills/`
+(pin + cite the commit, e.g. `open-lakehouse@39f32e68`).
 
 Suggested labels: `phase:2`..`phase:6`, `type:skill-port`, `type:distribution`,
 `type:tech-debt`, `type:docs`, `type:infra`, `good-first-issue`, `needs-verification`.
@@ -24,7 +24,7 @@ Source `spark-4-1`. Spark Connect-first workflows, `spark-submit`/`spark-sql` go
 catalog/storage wiring, a read-only `connect_check.py`. Resolve `spark.connect_uri`, UC REST,
 Iceberg REST, S3 via the resolver; master URL discovered/asked, never built; invocation modes
 from the profile.
-**Pre-applied review fixes (from the lost pilot):** `connect_check.py` must (a) never print
+**Known requirements:** `connect_check.py` must (a) never print
 `str(exc)` — only the exception class + static remediation (no-secret-echo); (b) fast-fail on
 a portless URI before any Connect attempt (no new default port); (c) bound the Connect attempt
 with a ~60s deadline (a TCP-open-but-not-Connect port hangs otherwise); and `catalog-wiring.md`
@@ -179,7 +179,6 @@ Tracking: UC backing store (H2 vs Postgres, LAK-4), Kafka version (3.5 vs 3.6, L
 Consider a protocol-level reachability check beyond a bare TCP probe (a TCP-open-but-wrong-service
 port currently looks "reachable"); confirm `mlflow.gateway_uri` intentionally has no preferred default.
 
-### LAK-30 — Durability + merge-gating process  `type:infra`
-Push every reviewed skill branch to the remote immediately after review (the Phase 2 pilot was
-lost to a local disk failure before push). Consider branch protection that blocks merge unless
+### LAK-30 — Branch protection + merge gating  `type:infra`
+Push reviewed branches promptly and add branch protection that blocks merge unless
 `skills-ci` passes.
