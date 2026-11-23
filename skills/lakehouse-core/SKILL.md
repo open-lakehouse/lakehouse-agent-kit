@@ -156,8 +156,18 @@ discovery and never type a host:port:
 
 ```bash
 eval "$(python3 -I scripts/resolve_endpoint.py spark.connect_uri --profile "<name-the-user-chose>" --format env)"
-spark-sql --remote "$LAKEHOUSE_SPARK_CONNECT_URI"
 ```
+
+Then connect with PySpark (preferred on Spark 4.1+; `spark-sql --remote` raises
+`NoClassDefFoundError` against a 4.1 Connect server):
+
+```python
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.remote("$LAKEHOUSE_SPARK_CONNECT_URI").getOrCreate()
+```
+
+For a CLI against the cluster binary instead of Connect, use the resolved invocation
+mode (e.g. `docker exec` / k8s) with `spark-sql` — not `--remote`.
 
 | Tier | What it does |
 |---|---|
