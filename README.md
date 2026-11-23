@@ -1,149 +1,209 @@
 <div align="center">
 
-
 # 🏞️ Lakehouse Agent Kit
 
-### Teach your coding agent to run an open lakehouse — no cloud vendor required.
+### Give any coding agent a safe, portable way to operate an open lakehouse.
 
-**Cross-agent [Agent Skills](https://agentskills.io) for Apache Spark · Delta Lake · Apache Iceberg · Unity Catalog (OSS) · Kafka · Airflow · MLflow · Delta Sharing.**
+**Agent Skills for Apache Spark, Delta Lake, Apache Iceberg, Unity Catalog OSS, Kafka, Airflow, MLflow, Delta Sharing, and S3-compatible storage.**
 
-<sub>🧪 **Status: v0.1 — foundations landed & cross-reviewed, engine skills in flight.** Apache-2.0.</sub>
+[![Skills CI](https://github.com/open-lakehouse/lakehouse-agent-kit/actions/workflows/skills-ci.yml/badge.svg)](https://github.com/open-lakehouse/lakehouse-agent-kit/actions/workflows/skills-ci.yml)
+[![Agent Skills](https://img.shields.io/badge/Agent%20Skills-specification-5b5bd6)](https://agentskills.io/specification)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-![Lakehouse Agent Kit — by Open Lakehouse + AI](docs/assets/banner.png)
+![Lakehouse Agent Kit: portable skills for open lakehouse engines](docs/assets/banner.png)
+
+**[Install the core skill](#install)** · **[Understand the safety model](#safety-boundary)** · **[Build the next engine skill](CONTRIBUTING.md)**
 
 </div>
 
 ---
 
-## 🤔 What is this?
+Your coding agent probably knows Spark syntax. It does not know which Spark cluster you mean, whether the Kafka CLI lives on the host or in a container, which catalog is safe to touch, or where credentials are allowed to come from.
 
-Drop these skills next to your coding agent and it stops guessing about your lakehouse. Ask it to *"compact the small files on the orders Iceberg table"* or *"wire this Kafka topic into a Structured Streaming job"* and it already knows the engine's CLI, the gotchas, and — crucially — **where your services actually live**.
+Lakehouse Agent Kit supplies that missing operational contract. Its parent skill, [`lakehouse-core`](skills/lakehouse-core/SKILL.md), selects and validates an explicit connection profile, resolves service endpoints without baking in one deployment, checks tool versions, and routes work to focused engine skills. The instructions follow the open [Agent Skills specification](https://agentskills.io/specification), so the same skill source can travel between coding agents.
 
-It's a parent skill, `lakehouse-core`, that figures out *how to connect*, then hands off to a focused **product skill** for the engine you're using. Each skill is plain Markdown with [progressive disclosure](https://agentskills.io/specification) (`SKILL.md` + `references/` + `scripts/`) that drives the engine's own CLI — no magic, no lock-in.
+The central rule is simple:
 
+> 🧭 **Discover topology. Never guess identity.**
+
+The kit may determine where a service is listening. It does not silently choose the profile, catalog, schema, bucket, table, or credentials on which an action has consequences.
+
+## ⚡ The 60-second tour
+
+```text
+request
+  │
+  ▼
+🧭 lakehouse-core
+  ├─ select an explicit profile          never auto-select
+  ├─ validate endpoints and secret refs  never print secret values
+  ├─ resolve topology                    config → discover → prefer → fail
+  ├─ check CLI version floors            stop on incompatible tools
+  └─ route by task
+       ├─ Spark
+       ├─ Iceberg / Delta
+       ├─ Kafka / Airflow / MLflow
+       └─ catalogs, sharing, and storage
 ```
-          you ──▶  lakehouse-core  ──▶  spark / delta / iceberg / kafka / …
-                   (connect + route)     (drive the native CLI)
-```
 
-## ✨ Why it's different: it adapts to *your* deployment
+An agent can use one profile with local binaries, Docker containers, or Kubernetes pods. Deployment-specific values stay in the profile; product knowledge stays in the skill.
 
-The [`open-lakehouse`](https://github.com/open-lakehouse/open-lakehouse) reference stack already ships great built-in skills — but they're **welded to one Docker Compose setup**: hardcoded `localhost` ports, container names, repo paths. Copy them to a different cluster and they quietly break.
+## ✨ What changes for the agent
 
-This kit rips out every hardcoded assumption and replaces it with two ideas:
+| Without Lakehouse Agent Kit | With Lakehouse Agent Kit |
+|---|---|
+| Reuses a remembered `localhost` port | Resolves the endpoint and records how it was found |
+| Picks the only profile because it looks obvious | Stops and asks the operator to select a profile |
+| Places tokens or passwords in config | Accepts only references to credential environment variables |
+| Assumes the CLI is installed locally | Uses the profile's `local`, `docker`, or `k8s` invocation mode |
+| Runs a command supported by a newer tool | Checks the product skill's version floor first |
+| Improvises support for an unfinished engine skill | States that the skill is not shipped yet |
 
-### 1. 🔌 A connection profile, not hardcoded hosts
-Endpoints, credentials, and invocation modes (local binary / `docker exec` / `kubectl`) come from a **[lakehouse connection profile](docs/connection-profile.md)** — a small TOML/env file — never from a value baked into a skill. Ship your profile, the skills follow.
+These are executable constraints, not style guidance. The repository linter rejects hardcoded endpoints, container assumptions, invalid skill links, oversized instructions, and non-portable frontmatter. Self-tests cover ambiguous discovery, invalid profiles, version comparisons, and secret-bearing inputs.
 
-### 2. 🧭 "Discover, don't hardcode; prefer, don't guess"
-Every skill resolves an endpoint in a fixed order, so it works whether or not you've configured anything:
+## 📦 What ships today
 
-| Step | What happens |
-|------|--------------|
-| **1. Config** | Your profile / env value wins, always. |
-| **2. Discover** | Not set? Probe the live environment — is the service reachable? which container is up? |
-| **3. Prefer** | Still ambiguous? Fall back to the conventional port (and *verify* it answers before trusting it). |
-| **4. Fail loud** | Nothing works? Stop and tell you exactly what to set — never silently assume. |
+**Status: v0.1 foundations.** The routing and portability layer is implemented and tested. Product-specific engine skills remain on the roadmap.
 
-…and a hard rule the agent never crosses: it discovers **topology** (where things are), but it **never guesses identity** — *which* catalog, schema, bucket, or credentials to touch is always confirmed with you. 🔒
+| Component | Purpose | Status |
+|---|---|---|
+| 🧭 [`lakehouse-core`](skills/lakehouse-core/SKILL.md) | Profile selection, validation, endpoint resolution, invocation modes, version floors, and routing | ✅ Shipping |
+| 🔌 [`load_profile.py`](skills/lakehouse-core/scripts/load_profile.py) | Load TOML, `.env`, or environment-based profiles without exposing secrets | ✅ Shipping |
+| 📡 [`resolve_endpoint.py`](skills/lakehouse-core/scripts/resolve_endpoint.py) | Resolve configured, discovered, or verified preferred endpoints with provenance | ✅ Shipping |
+| 📏 [`version_floor.py`](skills/lakehouse-core/scripts/version_floor.py) | Compare real CLI output with a required version floor | ✅ Shipping |
+| 🧪 [`lint_skills.py`](scripts/lint_skills.py) | Enforce the portable skill-authoring contract in CI | ✅ Shipping |
+| ⚙️ Spark, Delta, Iceberg, Unity Catalog, Kafka, Airflow, MLflow, SDP, Delta Sharing, object-store skills | Engine-specific operations routed through `lakehouse-core` | 🚧 Planned |
+| 📦 Cross-agent installer and generated plugin bundles | One-command distribution | 🗺️ Planned |
 
-> This isn't just documented — it's **CI-enforced.** A linter fails the build if a skill hardcodes `:9092` or `sc://localhost:15002` as an assumption instead of resolving it. The whole point is that the toolkit can't rot back into one-stack-only.
+The [implementation plan](IMPLEMENTATION_PLAN.md), [roadmap](ROADMAP.md), and [ready-to-file backlog](BACKLOG.md) describe the remaining work without presenting it as released functionality.
 
-## 🧰 The skill roster
-
-| Skill | Covers | v0.1 |
-|-------|--------|------|
-| 🧭 **lakehouse-core** | Connect, profile selection, version-floor check, endpoint resolver, routing | ✅ shipping |
-| ⚡ **spark** | Spark (Connect-first), `spark-submit` gotchas | 🚧 next |
-| 🔺 **delta** | Delta ops: `OPTIMIZE` / `VACUUM` / `MERGE` / time travel / CDF / UniForm | 🚧 next |
-| 🧊 **iceberg** | Iceberg: compaction, snapshots, schema evolution | 🚧 next |
-| 📚 **unity-catalog** | UC OSS REST, Spark wiring, credential vending | 🚧 next |
-| 🌊 **kafka** | Topics, connectors, Structured Streaming read/write | 🚧 next |
-| 🪁 **airflow** | DAG authoring, Airflow 2→3 changes, triggering Spark | 🚧 next |
-| 🔬 **mlflow** | Tracking, autologging, registry, AI gateway | 🚧 next |
-| 🛠️ **sdp** | Spark Declarative Pipelines (`pyspark.pipelines` + CLI) | 🚧 next |
-| 🤝 **delta-sharing** | Open sharing: server + client profile | 🚧 next |
-| 🪣 **object-store** | S3-compatible stores (MinIO / SeaweedFS) | 🚧 next |
-
-Plus an opt-in **`reference-stack`** profile that reproduces the `open-lakehouse` Compose stack so everything works out of the box on day one.
+<a id="install"></a>
 
 ## 🚀 Install
 
-Skills are just folders with a `SKILL.md`. Grab the kit, then point your agent at them:
+### 1. Clone the canonical toolkit
 
 ```bash
-git clone https://github.com/open-lakehouse/lakehouse-agent-kit
+git clone https://github.com/open-lakehouse/lakehouse-agent-kit.git
 cd lakehouse-agent-kit
 ```
 
-Then drop the skills into your agent's skills directory. 🧩 **This kit is built to the open [Agent Skills spec](https://agentskills.io/specification)**, so the neutral `.agents/skills/` path works for most agents:
+### 2. Install `lakehouse-core`
 
-```bash
-# Project scope — the neutral spec path (Cursor, Codex, Copilot, OpenCode, Pi all read this)
-mkdir -p .agents/skills && cp -r skills/lakehouse-core .agents/skills/
-#            …repeat for each product skill you want (skip skills/_template)
-```
-
-### Per-agent targets
+Agent Skills are directories. Copy or symlink the shipped skill into the scope used by the coding agent.
 
 | Agent | Project scope | Personal scope |
-|-------|---------------|----------------|
-| **Claude Code** | `.claude/skills/` | `~/.claude/skills/` |
-| **Codex** (OpenAI CLI) | `.agents/skills/` | `~/.agents/skills/` |
-| **Cursor** | `.agents/skills/` or `.cursor/skills/` | `~/.agents/skills/` or `~/.cursor/skills/` |
-| **GitHub Copilot** | `.github/skills/` or `.agents/skills/` | `~/.copilot/skills/` or `~/.agents/skills/` |
-| **OpenCode** | `.opencode/skills/` | `~/.config/opencode/skills/` |
-| **Pi** | `.pi/skills/` or `.agents/skills/` | `~/.pi/agent/skills/` or `~/.agents/skills/` |
-| **Omnigent** | *bundled with the agent config* — see below | — |
-| **Hermes** | *see below* | — |
+|---|---|---|
+| Claude Code | `.claude/skills/` | `~/.claude/skills/` |
+| Codex | `.agents/skills/` | `~/.agents/skills/` |
+| Cursor | `.agents/skills/` or `.cursor/skills/` | `~/.agents/skills/` or `~/.cursor/skills/` |
+| GitHub Copilot | `.github/skills/` or `.agents/skills/` | `~/.copilot/skills/` or `~/.agents/skills/` |
+| OpenCode | `.opencode/skills/` | `~/.config/opencode/skills/` |
+| Pi | `.pi/skills/` or `.agents/skills/` | `~/.pi/agent/skills/` or `~/.agents/skills/` |
+| Omnigent | `.agents/skills/` when the host exposes the shared Agent Skills catalog | Host-dependent |
 
-Most agents **auto-discover** skills on startup and load one when its description matches your request; some let you force it with `/lakehouse-core`. (Reload or restart after copying.)
-
-<details>
-<summary><b>Omnigent & Hermes</b> (skill-install path not yet publicly documented)</summary>
-
-- **Omnigent** loads skills from the **agent's bundle/config** rather than a user directory — an agent advertises its skills and loads one via its `load_skill` tool. To add these skills, include them in the agent's config bundle; consult your Omnigent agent-config docs for the exact `skills:` location. *(We won't print a path we can't verify.)*
-- **Hermes** — its skills mechanism isn't publicly documented yet. If it supports the Agent Skills spec, the neutral `.agents/skills/` convention is the thing to try; otherwise point it at the skills via its own instructions/config.
-
-Know the exact mechanism for either? PRs to this table very welcome. 🙏
-</details>
-
-### Coming soon 🛣️
+For example, install the core skill for a project that uses the neutral `.agents` path:
 
 ```bash
-# one-command cross-agent installer (auto-detects your agents)
-uvx lakehouse-agent-kit install
-
-# or via plugin marketplace
-claude plugin marketplace add open-lakehouse/lakehouse-agent-kit
+mkdir -p /path/to/project/.agents/skills
+cp -R skills/lakehouse-core /path/to/project/.agents/skills/
 ```
 
-## 🗺️ Roadmap
+Restart or reload the agent after installation. Product skills are not yet present; do not copy `skills/_template` as a usable skill.
 
-- [x] **Phase 1 — Foundations:** `lakehouse-core`, connection-profile contract, skills linter, CI.
-- [x] **Phase 1.5 — Generalization engine:** shared endpoint resolver (discover-then-prefer) + lint rules that *enforce* it, and a cited `reference-stack` profile.
-- [ ] **Phase 2 — Engine skills:** port the 9 engine skills, each parameterized, each cross-reviewed.
-- [ ] **Phase 3 — Reference-stack ops:** lifecycle / dashboard runbooks (opt-in).
-- [ ] **Phase 4 — Distribution:** plugin marketplace + `pip`/`uvx` installer.
-- [ ] **Phase 5 — MCP (optional):** complementary live-tools layer.
+### 3. Create a connection profile
 
-Full design, rationale, and open decisions live in [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md).
+Copy one of the generic templates and replace every placeholder with values for the target deployment:
 
-## 🛠️ How it works (under the hood)
+```bash
+cp templates/lakehouse.profile.example.toml ./dev.profile.toml
+$EDITOR ./dev.profile.toml
+python3 -I skills/lakehouse-core/scripts/load_profile.py \
+  --file ./dev.profile.toml \
+  --require spark
+```
 
-1. **`lakehouse-core` loads your profile** and refuses to guess which one — you pick it (just like the Databricks "never auto-select a profile" rule).
-2. It **checks the tool version floor** so skills don't hand you commands your CLI is too old to run.
-3. It **routes** to the product skill for your engine.
-4. That skill **resolves each endpoint** (config → discover → prefer → fail) and drives the engine's **native CLI** with the right invocation mode.
+TOML profiles require Python 3.11 or later. The equivalent `.env` profile works with Python 3.8 or later. See the [connection-profile reference](docs/connection-profile.md) for every field and the [`open-lakehouse` reference profile](templates/reference-stack.profile.toml) for a complete deployment example.
+
+Secrets never belong in a profile. A field such as `token_env` contains the **name** of an environment variable; the credential remains in the process environment.
+
+## 🧭 How endpoint resolution works
+
+Every supported endpoint follows one order:
+
+| Tier | Decision |
+|---|---|
+| **1 · Config** | The value in the operator-selected profile or environment wins. It remains authoritative even when a reachability probe warns. |
+| **2 · Discover** | Probe explicit candidates or, in Docker mode, inspect the configured service's published port. Ambiguity is an error. |
+| **3 · Prefer** | Try the service's conventional local endpoint only when it is reachable, and label the result as a preference. |
+| **4 · Fail** | Stop and name the profile key or environment variable that must be set. |
+
+The shared resolver implements this behavior once. Product skills call it instead of reproducing discovery logic or typing remembered ports.
+
+<a id="safety-boundary"></a>
+
+## 🛡️ The safety boundary
+
+Lakehouse Agent Kit separates facts that software can discover from choices that belong to the operator.
+
+### The kit can discover
+
+- whether a configured service endpoint is reachable;
+- which endpoint a specifically named Docker service publishes;
+- how an engine CLI must be invoked;
+- whether an installed tool satisfies a declared version floor; and
+- which product skill owns a task.
+
+### The kit must ask
+
+- which connection profile to use, even when only one exists;
+- which catalog, schema, table, bucket, or warehouse is the intended target;
+- whether a credential-bearing environment variable may be used; and
+- whether an operation with destructive or irreversible effects is authorized.
+
+Profile validation rejects credentials embedded in URIs or fields. Errors identify the location of invalid data without echoing its value. The endpoint resolver likewise suppresses candidate values and credential material in success and failure output.
+
+## 🧪 Verify the kit
+
+The local verification sequence is the same sequence used by [Skills CI](.github/workflows/skills-ci.yml):
+
+```bash
+python3 -I scripts/lint_skills.py
+python3 -I scripts/lint_skills.py --self-test
+python3 -I skills/lakehouse-core/scripts/load_profile.py --self-test
+python3 -I skills/lakehouse-core/scripts/version_floor.py --self-test
+python3 -I skills/lakehouse-core/scripts/resolve_endpoint.py --self-test
+```
+
+A successful run ends with the skill linter reporting clean skills and each helper reporting `self-test OK`.
+
+## 🗺️ Repository map
+
+| Path | Use it when… |
+|---|---|
+| [`skills/lakehouse-core/`](skills/lakehouse-core/) | Installing or changing the shipped parent skill |
+| [`skills/_template/`](skills/_template/) | Starting a new product skill |
+| [`docs/connection-profile.md`](docs/connection-profile.md) | Adding a deployment or resolving a profile validation error |
+| [`templates/`](templates/) | Creating a generic or reference-stack profile |
+| [`scripts/lint_skills.py`](scripts/lint_skills.py) | Checking portability and skill structure |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Implementing or reviewing an engine skill |
+| [`reference-stack/`](reference-stack/) | Working with deployment-specific `open-lakehouse` operations |
+| [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | Understanding design decisions and acceptance contracts |
 
 ## 🤝 Contributing
 
-We'd love help porting engine skills and adding deployment profiles. Start with the skill-authoring contract in [`CONTRIBUTING.md`](./CONTRIBUTING.md) and copy [`skills/_template/SKILL.md`](./skills/_template/SKILL.md). The golden rule: **resolve, don't hardcode** — the linter will hold you to it. Every skill is cross-reviewed by a different-vendor agent before a human merges.
+Engine knowledge belongs in focused product skills; deployment knowledge belongs in profiles; concrete stack operations belong in `reference-stack/`. That separation is the contribution contract.
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), copy [`skills/_template/SKILL.md`](skills/_template/SKILL.md), and run the complete verification sequence before opening a pull request. The linter will reject hardcoded topology, missing skill links, and non-portable metadata with `file:line` diagnostics.
+
+The highest-value next contributions are the planned Spark, Delta Lake, Apache Iceberg, Unity Catalog OSS, Kafka, Airflow, MLflow, Spark Declarative Pipelines, Delta Sharing, and object-store skills listed in the [backlog](BACKLOG.md).
 
 ## 📜 License
 
-[Apache-2.0](./LICENSE).
+Lakehouse Agent Kit is licensed under the [Apache License 2.0](LICENSE).
 
 <div align="center">
-<sub>Built by the Open Lakehouse community 🤖 + AI. Pixel robots not included.</sub>
+
+**Open lakehouse knowledge should travel with the agent—not with one vendor's deployment.** 🌊
+
 </div>
